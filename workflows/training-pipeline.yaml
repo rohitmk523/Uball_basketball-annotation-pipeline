@@ -1,0 +1,253 @@
+# Google Cloud Workflows - Direct Training Pipeline
+# This orchestrates the basketball annotation training pipeline without FastAPI
+
+main:
+  params: [args]
+  steps:
+    - init:
+        assign:
+          - game_id: ${args.game_id}
+          - pipeline_id: ${"pipeline_" + game_id + "_" + string(int(sys.now()))}
+          - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT")}
+          - location: "us-central1"
+        
+    - log_start:
+        call: sys.log
+        args:
+          data: '${"🚀 Starting direct training pipeline for game: " + game_id}'
+          severity: INFO
+    
+    - export_plays:
+        call: run_export_plays
+        args:
+          game_id: ${game_id}
+        result: export_result
+    
+    - check_export:
+        switch:
+          - condition: ${export_result.success}
+            next: extract_clips
+          - condition: true
+            next: export_failed
+    
+    - extract_clips:
+        call: run_clip_extraction
+        args:
+          game_id: ${game_id}
+          plays_file: ${export_result.plays_file}
+        result: clip_result
+    
+    - check_clips:
+        switch:
+          - condition: ${clip_result.success}
+            next: format_training_data
+          - condition: true
+            next: clips_failed
+    
+    - format_training_data:
+        call: run_format_training_data
+        args:
+          game_id: ${game_id}
+        result: format_result
+    
+    - check_format:
+        switch:
+          - condition: ${format_result.success}
+            next: train_model
+          - condition: true
+            next: format_failed
+    
+    - train_model:
+        call: run_model_training
+        args:
+          game_id: ${game_id}
+          training_file: ${format_result.training_file}
+          validation_file: ${format_result.validation_file}
+        result: training_result
+    
+    - check_training:
+        switch:
+          - condition: ${training_result.success}
+            next: success_notification
+          - condition: true
+            next: training_failed
+    
+    - export_failed:
+        call: sys.log
+        args:
+          data: '${"❌ Export plays failed: " + export_result.error}'
+          severity: ERROR
+        next: return_failure
+    
+    - clips_failed:
+        call: sys.log
+        args:
+          data: '${"❌ Clip extraction failed: " + clip_result.error}'
+          severity: ERROR
+        next: return_failure
+    
+    - format_failed:
+        call: sys.log
+        args:
+          data: '${"❌ Training data formatting failed: " + format_result.error}'
+          severity: ERROR
+        next: return_failure
+    
+    - training_failed:
+        call: sys.log
+        args:
+          data: '${"❌ Model training failed: " + training_result.error}'
+          severity: ERROR
+        next: return_failure
+    
+    - success_notification:
+        call: sys.log
+        args:
+          data: '${"✅ Training pipeline completed successfully for game: " + game_id}'
+          severity: INFO
+        next: return_success
+    
+    - return_success:
+        return:
+          success: true
+          game_id: ${game_id}
+          pipeline_id: ${pipeline_id}
+          training_job_id: ${training_result.job_id}
+          message: "Training pipeline completed successfully"
+    
+    - return_failure:
+        return:
+          success: false
+          game_id: ${game_id}
+          pipeline_id: ${pipeline_id}
+          message: "Training pipeline failed"
+
+# Export plays from database
+run_export_plays:
+  params: [game_id]
+  steps:
+    - log_export_start:
+        call: sys.log
+        args:
+          data: '${"📊 Exporting plays for game: " + game_id}'
+          severity: INFO
+    
+    - execute_export:
+        call: googleapis.cloudbuild.v1.projects.builds.create
+        args:
+          projectId: ${sys.get_env("GOOGLE_CLOUD_PROJECT")}
+          body:
+            steps:
+              - name: "python:3.11"
+                entrypoint: "bash"
+                args:
+                  - "-c"
+                  - '${"pip install -r requirements.txt && python scripts/training/export_plays.py " + game_id}'
+                env:
+                  - "SUPABASE_URL=$$SUPABASE_URL"
+                  - "SUPABASE_SERVICE_KEY=$$SUPABASE_SERVICE_KEY"
+            substitutions:
+              _GAME_ID: ${game_id}
+        result: build_response
+    
+    - return_export_result:
+        return:
+          success: true
+          plays_file: '${"output/training_data/plays_" + game_id + ".json"}'
+
+# Extract video clips  
+run_clip_extraction:
+  params: [game_id, plays_file]
+  steps:
+    - log_clips_start:
+        call: sys.log
+        args:
+          data: '${"🎬 Extracting clips for game: " + game_id}'
+          severity: INFO
+    
+    - execute_extraction:
+        call: googleapis.cloudbuild.v1.projects.builds.create
+        args:
+          projectId: ${sys.get_env("GOOGLE_CLOUD_PROJECT")}
+          body:
+            steps:
+              - name: "python:3.11"
+                entrypoint: "bash"
+                args:
+                  - "-c"
+                  - '${"apt-get update && apt-get install -y ffmpeg && pip install -r requirements.txt && python scripts/training/extract_clips.py " + plays_file}'
+                env:
+                  - "GCS_TRAINING_BUCKET=$$GCS_TRAINING_BUCKET"
+                  - "SUPABASE_URL=$$SUPABASE_URL"
+                  - "SUPABASE_SERVICE_KEY=$$SUPABASE_SERVICE_KEY"
+        result: build_response
+    
+    - return_clips_result:
+        return:
+          success: true
+          clips_path: '${"gs://" + sys.get_env("GCS_TRAINING_BUCKET") + "/clips/" + game_id}'
+
+# Format training data
+run_format_training_data:
+  params: [game_id]
+  steps:
+    - log_format_start:
+        call: sys.log
+        args:
+          data: '${"📝 Formatting training data for game: " + game_id}'
+          severity: INFO
+    
+    - execute_formatting:
+        call: googleapis.cloudbuild.v1.projects.builds.create
+        args:
+          projectId: ${sys.get_env("GOOGLE_CLOUD_PROJECT")}
+          body:
+            steps:
+              - name: "python:3.11"
+                entrypoint: "bash"
+                args:
+                  - "-c"
+                  - '${"pip install -r requirements.txt && python scripts/training/format_training_data.py " + game_id}'
+                env:
+                  - "GCS_TRAINING_BUCKET=$$GCS_TRAINING_BUCKET"
+                  - "SUPABASE_URL=$$SUPABASE_URL"
+                  - "SUPABASE_SERVICE_KEY=$$SUPABASE_SERVICE_KEY"
+        result: build_response
+    
+    - return_format_result:
+        return:
+          success: true
+          training_file: '${"gs://" + sys.get_env("GCS_TRAINING_BUCKET") + "/datasets/training_" + game_id + ".jsonl"}'
+          validation_file: '${"gs://" + sys.get_env("GCS_TRAINING_BUCKET") + "/datasets/validation_" + game_id + ".jsonl"}'
+
+# Train model using Vertex AI
+run_model_training:
+  params: [game_id, training_file, validation_file]
+  steps:
+    - log_training_start:
+        call: sys.log
+        args:
+          data: '${"🤖 Starting model training for game: " + game_id}'
+          severity: INFO
+    
+    - execute_training:
+        call: googleapis.cloudbuild.v1.projects.builds.create
+        args:
+          projectId: ${sys.get_env("GOOGLE_CLOUD_PROJECT")}
+          body:
+            steps:
+              - name: "python:3.11"
+                entrypoint: "bash"
+                args:
+                  - "-c"
+                  - '${"pip install -r requirements.txt && python scripts/training/train_model.py --training-data " + training_file + " --validation-data " + validation_file}'
+                env:
+                  - "GCP_PROJECT_ID=$$GCP_PROJECT_ID"
+                  - "GCS_TRAINING_BUCKET=$$GCS_TRAINING_BUCKET"
+                  - "VERTEX_AI_BASE_MODEL=gemini-1.5-pro-002"
+        result: build_response
+    
+    - return_training_result:
+        return:
+          success: true
+          job_id: '${"basketball-training-" + game_id + "-" + string(int(sys.now()))}'
