@@ -1,0 +1,40 @@
+# Core Dependencies
+python-dotenv>=1.0.0
+pydantic>=2.5.0,<3.0.0
+pydantic-settings>=2.1.0,<3.0.0
+
+# Supabase - Updated for compatibility
+supabase>=2.9.0
+postgrest>=0.17.0
+
+# Google Cloud Platform - Updated versions
+google-cloud-aiplatform>=1.38.1
+google-cloud-storage>=2.14.0
+google-cloud-logging>=3.9.0
+
+# FastAPI & API (Phase 2) - Updated versions
+fastapi>=0.108.0
+uvicorn[standard]>=0.25.0
+python-multipart>=0.0.6
+
+# Async & HTTP - Updated for compatibility
+httpx>=0.24.0
+aiofiles>=23.2.1
+
+# Data Processing
+ffmpeg-python>=0.2.0
+
+# Utilities
+tqdm>=4.66.1
+python-dateutil>=2.8.2
+
+# Testing - Updated versions
+pytest>=7.4.3
+pytest-asyncio>=0.21.1
+pytest-cov>=4.1.0
+
+# Development - Updated versions
+black>=23.12.1
+ruff>=0.1.9
+mypy>=1.8.0
+
