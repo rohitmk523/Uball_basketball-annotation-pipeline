@@ -16,8 +16,8 @@ class Settings(BaseSettings):
     API_BASE_URL: str = "http://localhost:8000"
     
     # Training Configuration
-    TRAINING_MODE: str = "local"  # local or cloud
-    TRAINING_WORKFLOW_NAME: str = "basketball-training-pipeline"
+    TRAINING_MODE: str = "local"  # local or hybrid (cloud uses hybrid)
+    TRAINING_WORKFLOW_NAME: str = "hybrid-training-pipeline"  # hybrid workflow
     TRAINING_WORKFLOW_LOCATION: str = "us-central1"
     
     # GCP

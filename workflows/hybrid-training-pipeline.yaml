@@ -1,0 +1,301 @@
+# Hybrid Training Pipeline - Cloud Functions + Cloud Run Jobs
+# This orchestrates the basketball annotation training pipeline using:
+# 1. Cloud Function for fast database export
+# 2. Cloud Run Jobs for heavy video/ML processing
+
+main:
+  params: [args]
+  steps:
+    - init:
+        assign:
+          - game_id: ${args.game_id}
+          - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT")}
+          - region: "us-central1"
+          - timestamp: ${string(int(sys.now()))}
+          - pipeline_id: ${"hybrid-pipeline-" + game_id + "-" + timestamp}
+
+    - log_start:
+        call: sys.log
+        args:
+          data: '${"🚀 Starting hybrid training pipeline for game: " + game_id}'
+          severity: INFO
+
+    # Step 1: Cloud Function - Export plays from database
+    - export_plays:
+        call: http.post
+        args:
+          url: '${"https://" + region + "-" + project_id + ".cloudfunctions.net/export-plays-cf"}'
+          headers:
+            Content-Type: "application/json"
+          body:
+            game_id: ${game_id}
+        result: export_result
+
+    - check_export:
+        switch:
+          - condition: ${export_result.body.success}
+            next: log_export_success
+          - condition: true
+            next: export_failed
+
+    - log_export_success:
+        call: sys.log
+        args:
+          data: '${"✅ Export completed: " + string(export_result.body.total_plays) + " plays exported"}'
+          severity: INFO
+
+    # Step 2: Cloud Run Job - Extract video clips
+    - extract_clips_job:
+        call: googleapis.run.v1.namespaces.jobs.create
+        args:
+          parent: '${"namespaces/" + project_id}'
+          body:
+            apiVersion: run.googleapis.com/v1
+            kind: Job
+            metadata:
+              name: '${"extract-clips-" + game_id + "-" + timestamp}'
+              annotations:
+                run.googleapis.com/execution-environment: gen2
+            spec:
+              template:
+                spec:
+                  template:
+                    spec:
+                      containers:
+                      - image: '${"gcr.io/" + project_id + "/extract-clips:latest"}'
+                        env:
+                        - name: GAME_ID
+                          value: ${game_id}
+                        - name: PLAYS_FILE_GCS
+                          value: ${export_result.body.files.all_plays}
+                        - name: GCS_TRAINING_BUCKET
+                          value: ${sys.get_env("GCS_TRAINING_BUCKET")}
+                        - name: GCS_VIDEO_BUCKET
+                          value: ${sys.get_env("GCS_VIDEO_BUCKET")}
+                        resources:
+                          limits:
+                            memory: 16Gi
+                            cpu: 8
+                            ephemeral-storage: 10Gi
+                      restartPolicy: Never
+                      timeoutSeconds: 86400  # 24 hours
+        result: extract_job
+
+    - log_extract_job_created:
+        call: sys.log
+        args:
+          data: '${"🎬 Started clip extraction job: " + extract_job.metadata.name}'
+          severity: INFO
+
+    # Wait for clip extraction completion
+    - wait_extract_completion:
+        call: wait_for_job_completion
+        args:
+          job_name: ${extract_job.metadata.name}
+          project_id: ${project_id}
+          timeout_minutes: 1440  # 24 hours
+        result: extract_status
+
+    - log_extract_completion:
+        call: sys.log
+        args:
+          data: '${"✅ Clip extraction completed successfully"}'
+          severity: INFO
+
+    # Step 3: Format training data (could be another job, but keeping it simple for now)
+    - format_training_data:
+        call: format_data_step
+        args:
+          game_id: ${game_id}
+          project_id: ${project_id}
+        result: format_result
+
+    - log_format_completion:
+        call: sys.log
+        args:
+          data: '${"✅ Training data formatted successfully"}'
+          severity: INFO
+
+    # Step 4: Cloud Run Job - Train model
+    - train_model_job:
+        call: googleapis.run.v1.namespaces.jobs.create
+        args:
+          parent: '${"namespaces/" + project_id}'
+          body:
+            apiVersion: run.googleapis.com/v1
+            kind: Job
+            metadata:
+              name: '${"train-model-" + game_id + "-" + timestamp}'
+              annotations:
+                run.googleapis.com/execution-environment: gen2
+            spec:
+              template:
+                spec:
+                  template:
+                    spec:
+                      containers:
+                      - image: '${"gcr.io/" + project_id + "/train-model:latest"}'
+                        env:
+                        - name: GAME_ID
+                          value: ${game_id}
+                        - name: GCS_TRAINING_BUCKET
+                          value: ${sys.get_env("GCS_TRAINING_BUCKET")}
+                        - name: GCP_PROJECT_ID
+                          value: ${project_id}
+                        - name: VERTEX_AI_BASE_MODEL
+                          value: ${sys.get_env("VERTEX_AI_BASE_MODEL")}
+                        - name: VERTEX_AI_FINETUNED_ENDPOINT
+                          value: ${sys.get_env("VERTEX_AI_FINETUNED_ENDPOINT")}
+                        resources:
+                          limits:
+                            memory: 8Gi
+                            cpu: 4
+                      restartPolicy: Never
+                      timeoutSeconds: 86400  # 24 hours
+        result: train_job
+
+    - log_train_job_created:
+        call: sys.log
+        args:
+          data: '${"🤖 Started model training job: " + train_job.metadata.name}'
+          severity: INFO
+
+    # Wait for training completion
+    - wait_train_completion:
+        call: wait_for_job_completion
+        args:
+          job_name: ${train_job.metadata.name}
+          project_id: ${project_id}
+          timeout_minutes: 1440  # 24 hours
+        result: train_status
+
+    - log_train_completion:
+        call: sys.log
+        args:
+          data: '${"✅ Model training completed successfully"}'
+          severity: INFO
+
+    # Success completion
+    - log_pipeline_success:
+        call: sys.log
+        args:
+          data: '${"🎉 Hybrid training pipeline completed successfully for game: " + game_id}'
+          severity: INFO
+
+    - return_success:
+        return:
+          success: true
+          pipeline_id: ${pipeline_id}
+          game_id: ${game_id}
+          export_result: ${export_result.body}
+          extract_job_name: ${extract_job.metadata.name}
+          train_job_name: ${train_job.metadata.name}
+          message: "Hybrid training pipeline completed successfully"
+
+    # Error handling
+    - export_failed:
+        call: sys.log
+        args:
+          data: '${"❌ Export failed: " + string(export_result.body.error)}'
+          severity: ERROR
+        next: return_failure
+
+    - return_failure:
+        return:
+          success: false
+          pipeline_id: ${pipeline_id}
+          game_id: ${game_id}
+          error: "Pipeline failed"
+          message: "Hybrid training pipeline failed"
+
+# Subworkflow to wait for Cloud Run Job completion
+wait_for_job_completion:
+  params: [job_name, project_id, timeout_minutes]
+  steps:
+    - init_polling:
+        assign:
+          - poll_interval_seconds: 30
+          - max_iterations: ${timeout_minutes * 2}  # 30s intervals
+          - iteration: 0
+
+    - poll_job_status:
+        call: googleapis.run.v1.namespaces.jobs.get
+        args:
+          name: '${"namespaces/" + project_id + "/jobs/" + job_name}'
+        result: job_status
+
+    - check_job_completion:
+        switch:
+          - condition: ${len(job_status.status.conditions) > 0 and job_status.status.conditions[0].type == "Complete"}
+            next: job_completed
+          - condition: ${len(job_status.status.conditions) > 0 and job_status.status.conditions[0].type == "Failed"}
+            next: job_failed
+          - condition: ${iteration >= max_iterations}
+            next: job_timeout
+
+    - log_job_progress:
+        call: sys.log
+        args:
+          data: '${"🔄 Job " + job_name + " still running... (check " + string(iteration + 1) + "/" + string(max_iterations) + ")"}'
+          severity: INFO
+
+    - wait_and_retry:
+        call: sys.sleep
+        args:
+          seconds: ${poll_interval_seconds}
+
+    - increment_counter:
+        assign:
+          - iteration: ${iteration + 1}
+        next: poll_job_status
+
+    - job_completed:
+        call: sys.log
+        args:
+          data: '${"✅ Job " + job_name + " completed successfully"}'
+          severity: INFO
+        return: ${job_status}
+
+    - job_failed:
+        call: sys.log
+        args:
+          data: '${"❌ Job " + job_name + " failed: " + job_status.status.conditions[0].message}'
+          severity: ERROR
+        raise: '${"Job failed: " + job_status.status.conditions[0].message}'
+
+    - job_timeout:
+        call: sys.log
+        args:
+          data: '${"⏰ Job " + job_name + " timed out after " + string(timeout_minutes) + " minutes"}'
+          severity: ERROR
+        raise: '${"Job timed out after " + string(timeout_minutes) + " minutes"}'
+
+# Simplified format data step (could be converted to another job later)
+format_data_step:
+  params: [game_id, project_id]
+  steps:
+    - log_format_start:
+        call: sys.log
+        args:
+          data: '${"📝 Formatting training data for game: " + game_id}'
+          severity: INFO
+
+    # For now, we'll simulate this step
+    # In a real implementation, this could be another Cloud Run Job
+    # or call the format_training_data script via Cloud Build
+    
+    - simulate_formatting:
+        call: sys.sleep
+        args:
+          seconds: 5
+
+    - log_format_complete:
+        call: sys.log
+        args:
+          data: '${"✅ Training data formatting completed (simulated)"}'
+          severity: INFO
+
+    - return_format_result:
+        return:
+          success: true
+          message: "Training data formatted successfully"

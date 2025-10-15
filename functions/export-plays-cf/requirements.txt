@@ -1,0 +1,12 @@
+# Cloud Function Dependencies for Export Plays
+functions-framework==3.*
+flask==2.3.*
+
+# Supabase client
+supabase==2.*
+
+# Google Cloud Storage
+google-cloud-storage==2.*
+
+# Utilities
+python-dotenv==1.*
