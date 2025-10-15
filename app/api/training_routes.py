@@ -206,19 +206,22 @@ async def run_local_training(job_id: str, game_id: str):
         training_jobs[job_id]["completed_at"] = datetime.now()
         logger.error(f"[{job_id}] Training failed: {e}")
 
-# Cloud training execution
+# Cloud training execution (hybrid mode)
 async def run_cloud_training(job_id: str, game_id: str):
-    """Run training pipeline using Google Cloud Workflows."""
+    """Run training pipeline using Hybrid Cloud Workflows (Functions + Jobs)."""
     try:
         training_jobs[job_id]["status"] = "running"
         training_jobs[job_id]["started_at"] = datetime.now()
-        training_jobs[job_id]["message"] = "Triggering Cloud Workflows training pipeline"
+        update_job_progress(job_id, "hybrid", 0, 4, "Triggering hybrid cloud training pipeline")
         
-        logger.info(f"[{job_id}] Triggering cloud training for game {game_id}")
+        logger.info(f"[{job_id}] Triggering hybrid cloud training for game {game_id}")
+        
+        # Use hybrid workflow instead of the old one
+        workflow_name = "hybrid-training-pipeline"
         
         # Execute gcloud workflows run command
         result = await asyncio.create_subprocess_exec(
-            "gcloud", "workflows", "run", settings.TRAINING_WORKFLOW_NAME,
+            "gcloud", "workflows", "run", workflow_name,
             "--data", f'{{"game_id": "{game_id}"}}',
             "--location", settings.TRAINING_WORKFLOW_LOCATION,
             "--format", "json",
@@ -228,26 +231,149 @@ async def run_cloud_training(job_id: str, game_id: str):
         stdout, stderr = await result.communicate()
         
         if result.returncode != 0:
-            raise Exception(f"Workflow execution failed: {stderr.decode()}")
+            raise Exception(f"Hybrid workflow execution failed: {stderr.decode()}")
         
         # Parse workflow execution ID from output
         import json
         workflow_result = json.loads(stdout.decode())
         execution_id = workflow_result.get("name", "").split("/")[-1]
         
-        training_jobs[job_id]["status"] = "completed"
-        training_jobs[job_id]["message"] = f"Cloud workflow triggered successfully (execution: {execution_id})"
-        training_jobs[job_id]["steps_completed"] = 4
-        training_jobs[job_id]["completed_at"] = datetime.now()
+        # Store execution details for monitoring
+        training_jobs[job_id]["execution_id"] = execution_id
+        training_jobs[job_id]["workflow_name"] = workflow_name
         
-        logger.info(f"[{job_id}] Cloud training triggered successfully")
+        # Start monitoring the workflow in the background
+        asyncio.create_task(monitor_hybrid_workflow(job_id, execution_id, game_id))
+        
+        logger.info(f"[{job_id}] Hybrid workflow triggered successfully: {execution_id}")
         
     except Exception as e:
         training_jobs[job_id]["status"] = "failed"
-        training_jobs[job_id]["message"] = f"Cloud training failed: {str(e)}"
+        training_jobs[job_id]["message"] = f"Hybrid training failed: {str(e)}"
         training_jobs[job_id]["error"] = str(e)
         training_jobs[job_id]["completed_at"] = datetime.now()
-        logger.error(f"[{job_id}] Cloud training failed: {e}")
+        logger.error(f"[{job_id}] Hybrid training failed: {e}")
+
+# New function to monitor hybrid workflow progress
+async def monitor_hybrid_workflow(job_id: str, execution_id: str, game_id: str):
+    """Monitor hybrid workflow execution and update progress."""
+    try:
+        logger.info(f"[{job_id}] Starting workflow monitoring for execution: {execution_id}")
+        
+        max_polls = 2880  # 24 hours at 30-second intervals
+        poll_count = 0
+        
+        while poll_count < max_polls:
+            try:
+                # Check workflow status
+                result = await asyncio.create_subprocess_exec(
+                    "gcloud", "workflows", "executions", "describe", execution_id,
+                    "--workflow", "hybrid-training-pipeline",
+                    "--location", settings.TRAINING_WORKFLOW_LOCATION,
+                    "--format", "json",
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE
+                )
+                stdout, stderr = await result.communicate()
+                
+                if result.returncode != 0:
+                    logger.warning(f"[{job_id}] Failed to get workflow status: {stderr.decode()}")
+                    await asyncio.sleep(30)
+                    poll_count += 1
+                    continue
+                
+                # Parse workflow status
+                execution_info = json.loads(stdout.decode())
+                state = execution_info.get("state", "UNKNOWN")
+                
+                # Update progress based on workflow state and steps
+                if state == "SUCCEEDED":
+                    update_job_progress(job_id, "completed", 4, 4, f"🎉 Hybrid training completed successfully for game {game_id}")
+                    training_jobs[job_id]["status"] = "completed"
+                    training_jobs[job_id]["completed_at"] = datetime.now()
+                    logger.info(f"[{job_id}] Workflow completed successfully")
+                    break
+                    
+                elif state == "FAILED":
+                    error_msg = execution_info.get("error", {}).get("message", "Unknown error")
+                    training_jobs[job_id]["status"] = "failed"
+                    training_jobs[job_id]["message"] = f"Workflow failed: {error_msg}"
+                    training_jobs[job_id]["error"] = error_msg
+                    training_jobs[job_id]["completed_at"] = datetime.now()
+                    logger.error(f"[{job_id}] Workflow failed: {error_msg}")
+                    break
+                    
+                elif state == "CANCELLED":
+                    training_jobs[job_id]["status"] = "failed"
+                    training_jobs[job_id]["message"] = "Workflow was cancelled"
+                    training_jobs[job_id]["completed_at"] = datetime.now()
+                    logger.warning(f"[{job_id}] Workflow was cancelled")
+                    break
+                    
+                elif state in ["ACTIVE", "RUNNING"]:
+                    # Try to extract current step information
+                    current_step = extract_current_step_from_workflow(execution_info)
+                    step_progress = map_workflow_step_to_progress(current_step)
+                    
+                    update_job_progress(
+                        job_id, 
+                        current_step, 
+                        step_progress["step_num"], 
+                        4, 
+                        f"🔄 {step_progress['message']} (execution: {execution_id})"
+                    )
+                    
+                    logger.debug(f"[{job_id}] Workflow running - step: {current_step}")
+                
+                # Wait before next poll
+                await asyncio.sleep(30)
+                poll_count += 1
+                
+            except Exception as e:
+                logger.error(f"[{job_id}] Error monitoring workflow: {e}")
+                await asyncio.sleep(30)
+                poll_count += 1
+        
+        # If we exit the loop without completion, it's a timeout
+        if training_jobs[job_id]["status"] == "running":
+            training_jobs[job_id]["status"] = "failed"
+            training_jobs[job_id]["message"] = "Workflow monitoring timed out"
+            training_jobs[job_id]["error"] = "Monitoring timeout"
+            training_jobs[job_id]["completed_at"] = datetime.now()
+            logger.error(f"[{job_id}] Workflow monitoring timed out")
+            
+    except Exception as e:
+        training_jobs[job_id]["status"] = "failed"
+        training_jobs[job_id]["message"] = f"Workflow monitoring failed: {str(e)}"
+        training_jobs[job_id]["error"] = str(e)
+        training_jobs[job_id]["completed_at"] = datetime.now()
+        logger.error(f"[{job_id}] Workflow monitoring failed: {e}")
+
+def extract_current_step_from_workflow(execution_info: dict) -> str:
+    """Extract current step name from workflow execution info."""
+    try:
+        # Look for current steps in the execution info
+        if "status" in execution_info and "currentSteps" in execution_info["status"]:
+            current_steps = execution_info["status"]["currentSteps"]
+            if current_steps:
+                return current_steps[0].get("step", "unknown")
+        return "unknown"
+    except Exception:
+        return "unknown"
+
+def map_workflow_step_to_progress(step_name: str) -> dict:
+    """Map workflow step names to progress information."""
+    step_mapping = {
+        "export_plays": {"step_num": 1, "message": "📊 Exporting plays from database"},
+        "extract_clips_job": {"step_num": 2, "message": "🎬 Extracting video clips"}, 
+        "wait_extract_completion": {"step_num": 2, "message": "🎬 Processing video clips"},
+        "format_training_data": {"step_num": 3, "message": "📝 Formatting training data"},
+        "train_model_job": {"step_num": 4, "message": "🤖 Training model with Vertex AI"},
+        "wait_train_completion": {"step_num": 4, "message": "🤖 Model training in progress"},
+        "unknown": {"step_num": 1, "message": "🔄 Processing"}
+    }
+    
+    return step_mapping.get(step_name, step_mapping["unknown"])
 
 @router.post("/pipeline", response_model=TrainingResponse)
 async def start_training_pipeline(
@@ -282,10 +408,11 @@ async def start_training_pipeline(
         # Execute based on mode
         if mode == "local":
             background_tasks.add_task(run_local_training, job_id, request.game_id)
-        elif mode == "cloud":
+        elif mode in ["cloud", "hybrid"]:
+            # Both cloud and hybrid use the new hybrid workflow
             background_tasks.add_task(run_cloud_training, job_id, request.game_id)
         else:
-            raise ValueError(f"Invalid training mode: {mode}")
+            raise ValueError(f"Invalid training mode: {mode}. Use 'local', 'cloud', or 'hybrid'")
         
         logger.info(f"✓ Started training job {job_id} for game {request.game_id} (mode: {mode})")
         
@@ -376,5 +503,18 @@ async def get_training_config():
         "environment": settings.ENVIRONMENT,
         "workflow_name": settings.TRAINING_WORKFLOW_NAME,
         "workflow_location": settings.TRAINING_WORKFLOW_LOCATION,
-        "gcp_project": settings.GCP_PROJECT_ID
+        "gcp_project": settings.GCP_PROJECT_ID,
+        "architecture": {
+            "local": "FastAPI runs Python scripts directly",
+            "hybrid": "Cloud Functions + Cloud Run Jobs (production)"
+        },
+        "current_architecture": get_architecture_description(settings.TRAINING_MODE)
     }
+
+def get_architecture_description(mode: str) -> str:
+    """Get description of current training architecture."""
+    descriptions = {
+        "local": "Local development - Scripts run directly in FastAPI process",
+        "hybrid": "Production cloud - Cloud Function for export + Cloud Run Jobs for heavy processing"
+    }
+    return descriptions.get(mode, "Production cloud (hybrid)")  # Default to hybrid for cloud/prod
