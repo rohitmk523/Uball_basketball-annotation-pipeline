@@ -137,6 +137,9 @@ export SUPABASE_SERVICE_KEY="your-supabase-key"
 ```bash
 cd functions/export-plays-cf
 
+# Load environment variables first
+set -a && source ../../.env.hybrid && set +a
+
 gcloud functions deploy export-plays-cf \
   --runtime python311 \
   --trigger-http \
@@ -144,18 +147,23 @@ gcloud functions deploy export-plays-cf \
   --memory 2GB \
   --timeout 900s \
   --region us-central1 \
-  --set-env-vars SUPABASE_URL=$SUPABASE_URL,SUPABASE_SERVICE_KEY=$SUPABASE_SERVICE_KEY
+  --entry-point export_plays_cf \
+  --set-env-vars SUPABASE_URL="$SUPABASE_URL",SUPABASE_SERVICE_KEY="$SUPABASE_SERVICE_KEY",GCS_TRAINING_BUCKET="$GCS_TRAINING_BUCKET"
 ```
+
+**⚠️ Security Note**: Environment variables are loaded from `.env.hybrid` file which is gitignored and contains your secrets securely.
 
 **4b. Build and Deploy Cloud Run Jobs**
 ```bash
 # Extract Clips Job
 cd jobs/extract-clips
-docker build -t gcr.io/$GCP_PROJECT_ID/extract-clips .
-docker push gcr.io/$GCP_PROJECT_ID/extract-clips
+
+# Build for AMD64 (required for Google Cloud)
+docker buildx build --platform linux/amd64 -t gcr.io/refined-circuit-474617-s8/extract-clips .
+docker push gcr.io/refined-circuit-474617-s8/extract-clips
 
 gcloud run jobs create extract-clips-job \
-  --image gcr.io/$GCP_PROJECT_ID/extract-clips \
+  --image gcr.io/refined-circuit-474617-s8/extract-clips \
   --region us-central1 \
   --memory 16Gi \
   --cpu 8 \
@@ -164,17 +172,23 @@ gcloud run jobs create extract-clips-job \
 
 # Train Model Job  
 cd ../train-model
-docker build -t gcr.io/$GCP_PROJECT_ID/train-model .
-docker push gcr.io/$GCP_PROJECT_ID/train-model
+
+# Build for AMD64 (required for Google Cloud)
+docker buildx build --platform linux/amd64 -t gcr.io/refined-circuit-474617-s8/train-model .
+docker push gcr.io/refined-circuit-474617-s8/train-model
 
 gcloud run jobs create train-model-job \
-  --image gcr.io/$GCP_PROJECT_ID/train-model \
+  --image gcr.io/refined-circuit-474617-s8/train-model \
   --region us-central1 \
   --memory 8Gi \
   --cpu 4 \
   --task-timeout 86400 \
   --max-retries 3
 ```
+
+**💡 Mac M4 Note**: Using `docker buildx build --platform linux/amd64` to ensure compatibility with Google Cloud's AMD64 infrastructure.
+
+**Note**: Jobs will inherit environment variables from the container images during runtime.
 
 **4c. Deploy Hybrid Workflow**
 ```bash
@@ -392,8 +406,21 @@ gcloud auth configure-docker
 gcloud services enable containerregistry.googleapis.com
 gcloud services enable cloudbuild.googleapis.com
 
-# Test Docker build
-docker build -t test-image jobs/extract-clips/
+# Test Docker build (Mac M4 users - use buildx)
+docker buildx build --platform linux/amd64 -t test-image jobs/extract-clips/
+```
+
+**7. "Architecture mismatch on Mac M4"**
+```bash
+# Error: exec /usr/local/bin/python: exec format error
+# Solution: Always use --platform linux/amd64
+docker buildx build --platform linux/amd64 -t gcr.io/project/image .
+
+# Check if buildx is available
+docker buildx version
+
+# Create buildx builder if needed
+docker buildx create --use
 ```
 
 ---
@@ -500,7 +527,33 @@ TRAINING_MODE=local uvicorn app.main:app --port 8000
 curl -X POST "http://localhost:8000/api/training/pipeline" -d '{"game_id": "test"}'
 ```
 
-**Production:**
+**Production (Manual Deployment):**
+```bash
+# 1. Setup service account
+./scripts/setup/create_service_account.sh
+
+# 2. Load environment variables
+set -a && source .env.hybrid && set +a
+
+# 3. Deploy Cloud Function
+cd functions/export-plays-cf
+gcloud functions deploy export-plays-cf \
+  --runtime python311 \
+  --trigger-http \
+  --allow-unauthenticated \
+  --memory 2GB \
+  --timeout 900s \
+  --region us-central1 \
+  --entry-point export_plays_cf \
+  --set-env-vars SUPABASE_URL="$SUPABASE_URL",SUPABASE_SERVICE_KEY="$SUPABASE_SERVICE_KEY",GCS_TRAINING_BUCKET="$GCS_TRAINING_BUCKET"
+
+# 4. Test function
+curl -X POST "https://us-central1-refined-circuit-474617-s8.cloudfunctions.net/export-plays-cf" \
+  -H "Content-Type: application/json" \
+  -d '{"game_id": "test-id"}'
+```
+
+**Production (One-Command):**
 ```bash
 ./scripts/deployment/deploy_hybrid_training.sh
 TRAINING_MODE=hybrid uvicorn app.main:app --port 8000  
