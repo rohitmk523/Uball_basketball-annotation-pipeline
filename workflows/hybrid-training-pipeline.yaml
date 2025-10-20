@@ -130,78 +130,48 @@ main:
           data: '${"✅ Training data formatted successfully"}'
           severity: INFO
 
-    # Step 4: Cloud Run Job - Train model
-    - train_model_job:
-        call: googleapis.run.v1.namespaces.jobs.create
+    # Step 4: Direct Vertex AI Model Fine-tuning
+    - create_tuning_job:
+        call: http.post
         args:
-          parent: '${"namespaces/" + project_id}'
-          location: ${region}
+          url: '${"https://" + region + "-aiplatform.googleapis.com/v1/projects/" + project_id + "/locations/" + region + "/tuningJobs"}'
+          auth:
+            type: OAuth2
+          headers:
+            Content-Type: "application/json"
           body:
-            apiVersion: run.googleapis.com/v1
-            kind: Job
-            metadata:
-              name: '${"train-model-" + game_id + "-" + timestamp}'
-            spec:
-              template:
-                spec:
-                  parallelism: 1
-                  taskCount: 1
-                  template:
-                    spec:
-                      containers:
-                      - image: '${"gcr.io/" + project_id + "/train-model:latest"}'
-                        env:
-                        - name: GAME_ID
-                          value: ${game_id}
-                        - name: GCS_TRAINING_BUCKET
-                          value: "uball-training-data"
-                        - name: GCP_PROJECT_ID
-                          value: ${project_id}
-                        - name: VERTEX_AI_BASE_MODEL
-                          value: "gemini-1.5-pro-002"
-                        - name: VERTEX_AI_FINETUNED_ENDPOINT
-                          value: ""
-                        resources:
-                          limits:
-                            memory: 8Gi
-                            cpu: "4"
-                      maxRetries: 3
-                      timeoutSeconds: "86400"
-        result: train_job
+            displayName: '${"basketball-model-" + game_id + "-" + timestamp}'
+            baseModel: "gemini-1.5-flash-001"
+            supervisedTuningSpec:
+              trainingDatasetUri: "gs://uball-training-data/datasets/training_d6ba2cbb-da84-4614-82fc-ff58ba12d5ab_20251020_052353.jsonl"
+              validationDatasetUri: "gs://uball-training-data/datasets/validation_d6ba2cbb-da84-4614-82fc-ff58ba12d5ab_20251020_052353.jsonl"
+              hyperParameters:
+                epochCount: "5"
+                learningRateMultiplier: "1.0"
+                adapterSize: "ADAPTER_SIZE_EIGHT"
+            tunedModelDisplayName: '${"basketball-model-" + game_id + "-" + timestamp}'
+        result: tuning_job_response
 
-    - log_train_job_created:
+    - log_tuning_job_created:
         call: sys.log
         args:
-          data: '${"🤖 Created model training job: " + train_job.metadata.name}'
+          data: '${"🤖 Created Vertex AI tuning job: " + tuning_job_response.body.name}'
           severity: INFO
 
-    # Execute the training job
-    - execute_train_job:
-        call: googleapis.run.v1.namespaces.jobs.run
+    # Monitor tuning job progress
+    - wait_tuning_completion:
+        call: monitor_tuning_job
         args:
-          name: '${"namespaces/" + project_id + "/jobs/" + train_job.metadata.name}'
-          location: ${region}
-        result: train_execution
-
-    - log_train_job_started:
-        call: sys.log
-        args:
-          data: '${"🚀 Executing model training job: " + train_execution.metadata.name}'
-          severity: INFO
-
-    # Wait for training completion
-    - wait_train_completion:
-        call: wait_for_execution_completion
-        args:
-          execution_name: ${train_execution.metadata.name}
+          job_name: ${tuning_job_response.body.name}
           project_id: ${project_id}
+          region: ${region}
           timeout_minutes: 480  # 8 hours for training
-        result: train_status
+        result: tuning_status
 
-    - log_train_completion:
+    - log_tuning_completion:
         call: sys.log
         args:
-          data: '${"✅ Model training completed successfully"}'
+          data: '${"✅ Vertex AI model fine-tuning completed successfully"}'
           severity: INFO
 
     # Success completion
@@ -218,8 +188,10 @@ main:
           game_id: ${game_id}
           export_result: ${export_result.body}
           extract_job_name: ${extract_job.metadata.name}
-          train_job_name: ${train_job.metadata.name}
-          message: "Hybrid training pipeline completed successfully"
+          tuning_job_name: ${tuning_job_response.body.name}
+          tuned_model: ${tuning_status.tuned_model}
+          vertex_ai_console: '${"https://console.cloud.google.com/vertex-ai/models?project=" + project_id}'
+          message: "Hybrid training pipeline completed successfully with Vertex AI fine-tuning"
 
     # Error handling
     - export_failed:
@@ -410,3 +382,97 @@ format_data_step:
         return:
           success: true
           message: "Training data formatted successfully"
+
+# Subworkflow to monitor Vertex AI tuning job completion
+monitor_tuning_job:
+  params: [job_name, project_id, region, timeout_minutes]
+  steps:
+    - init_polling:
+        assign:
+          - poll_interval_seconds: 60  # Check every minute for tuning jobs
+          - max_iterations: ${timeout_minutes}  # 1-minute intervals
+          - iteration: 0
+
+    - poll_tuning_status:
+        call: http.get
+        args:
+          url: '${"https://" + region + "-aiplatform.googleapis.com/v1/" + job_name}'
+          auth:
+            type: OAuth2
+        result: tuning_status
+
+    - check_tuning_completion:
+        switch:
+          - condition: ${tuning_status.body.state == "JOB_STATE_SUCCEEDED"}
+            next: tuning_completed
+          - condition: ${tuning_status.body.state == "JOB_STATE_FAILED"}
+            next: tuning_failed
+          - condition: ${tuning_status.body.state == "JOB_STATE_CANCELLED"}
+            next: tuning_cancelled
+          - condition: ${iteration >= max_iterations}
+            next: tuning_timeout
+
+    - log_tuning_progress:
+        call: sys.log
+        args:
+          data: '${"🔄 Tuning job " + job_name + " state: " + tuning_status.body.state + " (check " + string(iteration + 1) + "/" + string(max_iterations) + ")"}'
+          severity: INFO
+
+    - wait_and_retry:
+        call: sys.sleep
+        args:
+          seconds: ${poll_interval_seconds}
+
+    - increment_counter:
+        assign:
+          - iteration: ${iteration + 1}
+        next: poll_tuning_status
+
+    - tuning_completed:
+        steps:
+          - log_completion:
+              call: sys.log
+              args:
+                data: '${"✅ Tuning job " + job_name + " completed successfully"}'
+                severity: INFO
+          - log_model_info:
+              call: sys.log
+              args:
+                data: '${"🎯 Fine-tuned model: " + tuning_status.body.tunedModel.name}'
+                severity: INFO
+          - return_success:
+              return: 
+                success: true
+                state: ${tuning_status.body.state}
+                tuned_model: ${tuning_status.body.tunedModel.name}
+                tuning_job: ${job_name}
+
+    - tuning_failed:
+        steps:
+          - log_failure:
+              call: sys.log
+              args:
+                data: '${"❌ Tuning job " + job_name + " failed: " + tuning_status.body.error.message}'
+                severity: ERROR
+          - raise_failure:
+              raise: '${"Tuning job failed: " + tuning_status.body.error.message}'
+
+    - tuning_cancelled:
+        steps:
+          - log_cancellation:
+              call: sys.log
+              args:
+                data: '${"⚠️ Tuning job " + job_name + " was cancelled"}'
+                severity: WARNING
+          - raise_cancellation:
+              raise: '${"Tuning job was cancelled: " + job_name}'
+
+    - tuning_timeout:
+        steps:
+          - log_timeout:
+              call: sys.log
+              args:
+                data: '${"⏰ Tuning job " + job_name + " timed out after " + string(timeout_minutes) + " minutes"}'
+                severity: ERROR
+          - raise_timeout:
+              raise: '${"Tuning job timed out after " + string(timeout_minutes) + " minutes"}'
