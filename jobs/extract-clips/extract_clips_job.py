@@ -41,6 +41,10 @@ class ClipExtractorJob:
         self.storage_client = storage.Client()
         self.training_bucket = self.storage_client.bucket(training_bucket)
         
+        # Game-based directory structure
+        self.game_dir = f"games/{game_id}"
+        self.clips_dir = f"{self.game_dir}/clips"
+        
         # Create local working directories
         self.temp_dir = Path("/tmp/clips_job")
         self.temp_dir.mkdir(parents=True, exist_ok=True)
@@ -51,6 +55,10 @@ class ClipExtractorJob:
         logger.info(f"✓ Initialized ClipExtractorJob for game {game_id}")
         logger.info(f"✓ Loaded {len(self.plays)} plays from {plays_file_gcs}")
         logger.info(f"✓ Using {max_workers} parallel workers")
+        logger.info(f"✓ Clips will be saved to: gs://{training_bucket}/{self.clips_dir}/")
+        
+        # Validate that required videos exist
+        self._validate_required_videos()
     
     def _download_and_load_plays(self) -> List[Dict[str, Any]]:
         """Download plays file from GCS and load JSON data."""
@@ -84,21 +92,43 @@ class ClipExtractorJob:
             raise
     
     def _get_video_gcs_path(self, game_id: str, angle: str) -> str:
-        """Get GCS path for game video based on angle."""
-        angle_to_filename = {
-            "FAR_LEFT": "game3_farleft.mp4",
-            "FAR_RIGHT": "game3_farright.mp4", 
-            "NEAR_LEFT": "game3_nearleft.mp4",
-            "NEAR_RIGHT": "game3_nearright.mp4"
+        """Get GCS path for game video based on angle using Games/{game_id}/ structure."""
+        # Try different naming patterns in order of preference
+        angle_suffix_map = {
+            "FAR_LEFT": "farleft",
+            "FAR_RIGHT": "farright", 
+            "NEAR_LEFT": "nearleft",
+            "NEAR_RIGHT": "nearright"
         }
         
-        if angle not in angle_to_filename:
-            raise Exception(f"Unknown angle: {angle}. Expected: {list(angle_to_filename.keys())}")
+        if angle not in angle_suffix_map:
+            raise Exception(f"Unknown angle: {angle}. Expected: {list(angle_suffix_map.keys())}")
         
-        filename = angle_to_filename[angle]
-        blob_path = f"{game_id}/{filename}"
+        angle_suffix = angle_suffix_map[angle]
         
-        return blob_path
+        # Get video bucket to check which naming pattern exists
+        video_bucket_name = os.getenv("GCS_VIDEO_BUCKET", "uball-videos-production")
+        video_bucket = self.storage_client.bucket(video_bucket_name)
+        
+        # Try different naming patterns
+        naming_patterns = [
+            f"test_{angle_suffix}.mp4",      # test_farleft.mp4
+            f"game1_{angle_suffix}.mp4",     # game1_farleft.mp4  
+            f"game2_{angle_suffix}.mp4",     # game2_farleft.mp4
+            f"game3_{angle_suffix}.mp4",     # game3_farleft.mp4
+            f"{angle_suffix}.mp4",           # farleft.mp4
+            f"{angle}.mp4",                  # FAR_LEFT.mp4
+        ]
+        
+        for pattern in naming_patterns:
+            blob_path = f"Games/{game_id}/{pattern}"
+            blob = video_bucket.blob(blob_path)
+            if blob.exists():
+                logger.debug(f"✓ Found video with pattern: {pattern}")
+                return blob_path
+        
+        # If no pattern found, return the first pattern for error reporting
+        return f"Games/{game_id}/{naming_patterns[0]}"
     
     def _download_video_if_needed(self, game_id: str, angle: str) -> Path:
         """Download video from GCS if not already cached locally."""
@@ -111,21 +141,20 @@ class ClipExtractorJob:
                 logger.debug(f"✓ Using cached video: {local_video_path}")
                 return local_video_path
             
-            # Download from GCS
+            # Download from GCS video bucket
             blob_path = self._get_video_gcs_path(game_id, angle)
             
-            # Try training bucket first, then video bucket
+            # Get video bucket from environment
+            video_bucket_name = os.getenv("GCS_VIDEO_BUCKET", "uball-videos-production") 
+            video_bucket = self.storage_client.bucket(video_bucket_name)
+            
             try:
-                blob = self.training_bucket.blob(blob_path)
-                blob.download_to_filename(local_video_path)
-                logger.info(f"✓ Downloaded video from training bucket: {blob_path}")
-            except Exception:
-                # Fallback to video bucket
-                video_bucket_name = os.environ.get("GCS_VIDEO_BUCKET", "uball-videos-production")
-                video_bucket = self.storage_client.bucket(video_bucket_name)
                 blob = video_bucket.blob(blob_path)
                 blob.download_to_filename(local_video_path)
-                logger.info(f"✓ Downloaded video from video bucket: {blob_path}")
+                logger.info(f"✓ Downloaded video: gs://{video_bucket_name}/{blob_path}")
+            except Exception as e:
+                logger.error(f"✗ Failed to download video gs://{video_bucket_name}/{blob_path}: {e}")
+                raise
             
             return local_video_path
             
@@ -170,6 +199,93 @@ class ClipExtractorJob:
             logger.error(f"✗ Upload failed: {e}")
             raise
     
+    def _save_game_metadata(self, success_count: int, fail_count: int, total_needed: int):
+        """Save game metadata and plays list to GCS."""
+        import datetime
+        
+        metadata = {
+            "game_id": self.game_id,
+            "extraction_timestamp": datetime.datetime.utcnow().isoformat(),
+            "total_plays": len(self.plays),
+            "total_clips_needed": total_needed,
+            "clips_extracted": success_count,
+            "clips_failed": fail_count,
+            "success_rate": (success_count / total_needed * 100) if total_needed > 0 else 0,
+            "plays": self.plays
+        }
+        
+        try:
+            # Save metadata
+            metadata_path = f"{self.game_dir}/metadata.json"
+            blob = self.training_bucket.blob(metadata_path)
+            blob.upload_from_string(json.dumps(metadata, indent=2))
+            logger.info(f"✓ Saved game metadata to gs://{self.training_bucket_name}/{metadata_path}")
+            
+            # Save plays list separately for easy access
+            plays_path = f"{self.game_dir}/plays.json"
+            blob = self.training_bucket.blob(plays_path)
+            blob.upload_from_string(json.dumps(self.plays, indent=2))
+            logger.info(f"✓ Saved plays data to gs://{self.training_bucket_name}/{plays_path}")
+            
+        except Exception as e:
+            logger.error(f"✗ Failed to save game metadata: {e}")
+
+    def _validate_required_videos(self):
+        """Validate that all required video files exist in GCS before starting extraction."""
+        logger.info("🔍 Validating video files exist in GCS...")
+        
+        # Get video bucket from env
+        video_bucket_name = os.getenv("GCS_VIDEO_BUCKET", "uball-videos-production")
+        video_bucket = self.storage_client.bucket(video_bucket_name)
+        
+        # Get all unique angles from plays
+        required_angles = set()
+        for play in self.plays:
+            training_angles = self._get_training_angles(play["angle"])
+            required_angles.update(training_angles)
+        
+        logger.info(f"🎯 Required video angles for this game: {sorted(required_angles)}")
+        
+        missing_videos = []
+        found_videos = []
+        
+        for angle in required_angles:
+            try:
+                video_path = self._get_video_gcs_path(self.game_id, angle)
+                blob = video_bucket.blob(video_path)
+                
+                if blob.exists():
+                    # Check if file is not empty
+                    blob.reload()
+                    if blob.size > 0:
+                        found_videos.append(f"gs://{video_bucket_name}/{video_path}")
+                        logger.info(f"✓ Found video: gs://{video_bucket_name}/{video_path} ({blob.size} bytes)")
+                    else:
+                        missing_videos.append(f"gs://{video_bucket_name}/{video_path} (empty file)")
+                        logger.error(f"✗ Empty video file: gs://{video_bucket_name}/{video_path}")
+                else:
+                    missing_videos.append(f"gs://{video_bucket_name}/{video_path}")
+                    logger.error(f"✗ Missing video: gs://{video_bucket_name}/{video_path}")
+                    
+            except Exception as e:
+                missing_videos.append(f"gs://{video_bucket_name}/{video_path} (error: {e})")
+                logger.error(f"✗ Error checking video {angle}: {e}")
+        
+        # Report results
+        logger.info(f"📊 Video validation results:")
+        logger.info(f"  ✅ Found videos: {len(found_videos)}")
+        logger.info(f"  ❌ Missing videos: {len(missing_videos)}")
+        
+        if missing_videos:
+            error_msg = f"Missing required video files:\n" + "\n".join([f"  - {video}" for video in missing_videos])
+            error_msg += f"\n\nExpected path structure: gs://{video_bucket_name}/Games/{self.game_id}/{{angle}}.mp4"
+            error_msg += f"\nRequired angles: {sorted(required_angles)}"
+            logger.error(f"❌ {error_msg}")
+            raise FileNotFoundError(error_msg)
+        
+        logger.info("✅ All required videos found and validated!")
+
+    
     def _get_training_angles(self, play_angle: str) -> List[str]:
         """Get camera angles to use for training based on play's detected angle."""
         angle_mapping = {
@@ -178,8 +294,7 @@ class ClipExtractorJob:
         }
         
         if play_angle not in angle_mapping:
-            logger.warning(f"⚠ Unknown play angle: {play_angle}. Using single angle.")
-            return [play_angle]
+            raise ValueError(f"Invalid play angle: {play_angle}. Expected: {list(angle_mapping.keys())}")
         
         return angle_mapping[play_angle]
     
@@ -214,8 +329,8 @@ class ClipExtractorJob:
                     # Extract clip
                     self._extract_clip(video_path, start_timestamp, end_timestamp, local_clip_path)
                     
-                    # Upload to GCS
-                    gcs_clip_path = f"clips/{game_id}/{play_id}/{training_angle}.mp4"
+                    # Upload to GCS using game-based structure
+                    gcs_clip_path = f"{self.clips_dir}/{play_id}_{training_angle}.mp4"
                     self._upload_clip_to_gcs(local_clip_path, gcs_clip_path)
                     
                     # Clean up local clip
@@ -272,6 +387,9 @@ class ClipExtractorJob:
             training_angles = self._get_training_angles(play["angle"])
             total_clips_needed += len(training_angles)
         
+        # Save game metadata
+        self._save_game_metadata(success_count, fail_count, total_clips_needed)
+        
         # Final summary
         logger.info(f"🎉 CLIP EXTRACTION COMPLETE")
         logger.info(f"📊 Total plays processed: {len(self.plays)}")
@@ -290,5 +408,5 @@ class ClipExtractorJob:
             "clips_extracted": success_count,
             "clips_failed": fail_count,
             "success_rate": (success_count / total_clips_needed * 100) if total_clips_needed > 0 else 0,
-            "clips_location": f"gs://{self.training_bucket_name}/clips/{self.game_id}/"
+            "clips_location": f"gs://{self.training_bucket_name}/{self.clips_dir}/"
         }

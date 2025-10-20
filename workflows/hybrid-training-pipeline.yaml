@@ -49,50 +49,65 @@ main:
         call: googleapis.run.v1.namespaces.jobs.create
         args:
           parent: '${"namespaces/" + project_id}'
+          location: ${region}
           body:
             apiVersion: run.googleapis.com/v1
             kind: Job
             metadata:
               name: '${"extract-clips-" + game_id + "-" + timestamp}'
-              annotations:
-                run.googleapis.com/execution-environment: gen2
             spec:
               template:
                 spec:
-                  taskTimeout: "24h"
-                  maxRetries: 3
                   parallelism: 1
-                  containers:
-                  - image: '${"gcr.io/" + project_id + "/extract-clips:latest"}'
-                    env:
-                    - name: GAME_ID
-                      value: ${game_id}
-                    - name: PLAYS_FILE_GCS
-                      value: ${export_result.body.files.all_plays}
-                    - name: GCS_TRAINING_BUCKET
-                      value: ${sys.get_env("GCS_TRAINING_BUCKET")}
-                    - name: GCS_VIDEO_BUCKET
-                      value: ${sys.get_env("GCS_VIDEO_BUCKET")}
-                    resources:
-                      limits:
-                        memory: 16Gi
-                        cpu: "8"
-                        ephemeral-storage: 10Gi
+                  taskCount: 1
+                  template:
+                    spec:
+                      containers:
+                      - image: '${"gcr.io/" + project_id + "/extract-clips:latest"}'
+                        env:
+                        - name: GAME_ID
+                          value: ${game_id}
+                        - name: PLAYS_FILE_GCS
+                          value: ${export_result.body.files.all_plays}
+                        - name: GCS_TRAINING_BUCKET
+                          value: "uball-training-data"
+                        - name: GCS_VIDEO_BUCKET
+                          value: "uball-videos-production"
+                        resources:
+                          limits:
+                            memory: 16Gi
+                            cpu: "8"
+                      maxRetries: 3
+                      timeoutSeconds: "86400"
         result: extract_job
 
     - log_extract_job_created:
         call: sys.log
         args:
-          data: '${"🎬 Started clip extraction job: " + extract_job.metadata.name}'
+          data: '${"🎬 Created clip extraction job: " + extract_job.metadata.name}'
+          severity: INFO
+
+    # Execute the job
+    - execute_extract_job:
+        call: googleapis.run.v1.namespaces.jobs.run
+        args:
+          name: '${"namespaces/" + project_id + "/jobs/" + extract_job.metadata.name}'
+          location: ${region}
+        result: extract_execution
+
+    - log_extract_job_started:
+        call: sys.log
+        args:
+          data: '${"🚀 Executing clip extraction job: " + extract_execution.metadata.name}'
           severity: INFO
 
     # Wait for clip extraction completion
     - wait_extract_completion:
-        call: wait_for_job_completion
+        call: wait_for_execution_completion
         args:
-          job_name: ${extract_job.metadata.name}
+          execution_name: ${extract_execution.metadata.name}
           project_id: ${project_id}
-          timeout_minutes: 1440  # 24 hours
+          timeout_minutes: 60  # 1 hour should be enough for clip extraction
         result: extract_status
 
     - log_extract_completion:
@@ -120,51 +135,67 @@ main:
         call: googleapis.run.v1.namespaces.jobs.create
         args:
           parent: '${"namespaces/" + project_id}'
+          location: ${region}
           body:
             apiVersion: run.googleapis.com/v1
             kind: Job
             metadata:
               name: '${"train-model-" + game_id + "-" + timestamp}'
-              annotations:
-                run.googleapis.com/execution-environment: gen2
             spec:
               template:
                 spec:
-                  taskTimeout: "24h"
-                  maxRetries: 3
                   parallelism: 1
-                  containers:
-                  - image: '${"gcr.io/" + project_id + "/train-model:latest"}'
-                    env:
-                    - name: GAME_ID
-                      value: ${game_id}
-                    - name: GCS_TRAINING_BUCKET
-                      value: ${sys.get_env("GCS_TRAINING_BUCKET")}
-                    - name: GCP_PROJECT_ID
-                      value: ${project_id}
-                    - name: VERTEX_AI_BASE_MODEL
-                      value: ${sys.get_env("VERTEX_AI_BASE_MODEL")}
-                    - name: VERTEX_AI_FINETUNED_ENDPOINT
-                      value: ${sys.get_env("VERTEX_AI_FINETUNED_ENDPOINT")}
-                    resources:
-                      limits:
-                        memory: 8Gi
-                        cpu: "4"
+                  taskCount: 1
+                  template:
+                    spec:
+                      containers:
+                      - image: '${"gcr.io/" + project_id + "/train-model:latest"}'
+                        env:
+                        - name: GAME_ID
+                          value: ${game_id}
+                        - name: GCS_TRAINING_BUCKET
+                          value: "uball-training-data"
+                        - name: GCP_PROJECT_ID
+                          value: ${project_id}
+                        - name: VERTEX_AI_BASE_MODEL
+                          value: "gemini-1.5-pro-002"
+                        - name: VERTEX_AI_FINETUNED_ENDPOINT
+                          value: ""
+                        resources:
+                          limits:
+                            memory: 8Gi
+                            cpu: "4"
+                      maxRetries: 3
+                      timeoutSeconds: "86400"
         result: train_job
 
     - log_train_job_created:
         call: sys.log
         args:
-          data: '${"🤖 Started model training job: " + train_job.metadata.name}'
+          data: '${"🤖 Created model training job: " + train_job.metadata.name}'
+          severity: INFO
+
+    # Execute the training job
+    - execute_train_job:
+        call: googleapis.run.v1.namespaces.jobs.run
+        args:
+          name: '${"namespaces/" + project_id + "/jobs/" + train_job.metadata.name}'
+          location: ${region}
+        result: train_execution
+
+    - log_train_job_started:
+        call: sys.log
+        args:
+          data: '${"🚀 Executing model training job: " + train_execution.metadata.name}'
           severity: INFO
 
     # Wait for training completion
     - wait_train_completion:
-        call: wait_for_job_completion
+        call: wait_for_execution_completion
         args:
-          job_name: ${train_job.metadata.name}
+          execution_name: ${train_execution.metadata.name}
           project_id: ${project_id}
-          timeout_minutes: 1440  # 24 hours
+          timeout_minutes: 480  # 8 hours for training
         result: train_status
 
     - log_train_completion:
@@ -206,7 +237,79 @@ main:
           error: "Pipeline failed"
           message: "Hybrid training pipeline failed"
 
-# Subworkflow to wait for Cloud Run Job completion
+# Subworkflow to wait for Cloud Run Job Execution completion
+wait_for_execution_completion:
+  params: [execution_name, project_id, timeout_minutes]
+  steps:
+    - init_polling:
+        assign:
+          - poll_interval_seconds: 30
+          - max_iterations: ${timeout_minutes * 2}  # 30s intervals
+          - iteration: 0
+
+    - poll_execution_status:
+        call: googleapis.run.v1.namespaces.executions.get
+        args:
+          name: '${"namespaces/" + project_id + "/executions/" + execution_name}'
+          location: us-central1
+        result: execution_status
+
+    - check_execution_completion:
+        switch:
+          - condition: ${len(execution_status.status.conditions) > 0 and execution_status.status.conditions[0].type == "Completed"}
+            next: execution_completed
+          - condition: ${len(execution_status.status.conditions) > 0 and execution_status.status.conditions[0].type == "Failed"}
+            next: execution_failed
+          - condition: ${iteration >= max_iterations}
+            next: execution_timeout
+
+    - log_execution_progress:
+        call: sys.log
+        args:
+          data: '${"🔄 Execution " + execution_name + " still running... (check " + string(iteration + 1) + "/" + string(max_iterations) + ")"}'
+          severity: INFO
+
+    - wait_and_retry:
+        call: sys.sleep
+        args:
+          seconds: ${poll_interval_seconds}
+
+    - increment_counter:
+        assign:
+          - iteration: ${iteration + 1}
+        next: poll_execution_status
+
+    - execution_completed:
+        steps:
+          - log_completion:
+              call: sys.log
+              args:
+                data: '${"✅ Execution " + execution_name + " completed successfully"}'
+                severity: INFO
+          - return_success:
+              return: ${execution_status}
+
+    - execution_failed:
+        steps:
+          - log_failure:
+              call: sys.log
+              args:
+                data: '${"❌ Execution " + execution_name + " failed: " + execution_status.status.conditions[0].message}'
+                severity: ERROR
+          - raise_error:
+              raise: '${"Execution failed: " + execution_status.status.conditions[0].message}'
+
+    - execution_timeout:
+        steps:
+          - log_timeout:
+              call: sys.log
+              args:
+                data: '${"⏰ Execution " + execution_name + " timed out after " + string(timeout_minutes) + " minutes"}'
+                severity: ERROR
+          - raise_timeout:
+              raise: '${"Execution timed out after " + string(timeout_minutes) + " minutes"}'
+
+# Legacy subworkflow for job definition polling (kept for compatibility)
 wait_for_job_completion:
   params: [job_name, project_id, timeout_minutes]
   steps:
@@ -220,6 +323,7 @@ wait_for_job_completion:
         call: googleapis.run.v1.namespaces.jobs.get
         args:
           name: '${"namespaces/" + project_id + "/jobs/" + job_name}'
+          location: us-central1
         result: job_status
 
     - check_job_completion:
