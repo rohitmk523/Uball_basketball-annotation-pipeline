@@ -22,7 +22,7 @@ logger = logging.getLogger(__name__)
 class ClipExtractorJob:
     """Extract video clips for training in Cloud Run Job environment."""
     
-    def __init__(self, game_id: str, plays_file_gcs: str, training_bucket: str, max_workers: int = 4):
+    def __init__(self, game_id: str, plays_file_gcs: str, training_bucket: str, max_workers: int = 4, skip_if_exists: bool = True):
         """
         Initialize clip extractor for Cloud Run Job.
         
@@ -31,11 +31,13 @@ class ClipExtractorJob:
             plays_file_gcs: GCS URI to plays JSON file
             training_bucket: GCS bucket name for training data
             max_workers: Maximum number of parallel workers
+            skip_if_exists: Skip extraction if clips already exist
         """
         self.game_id = game_id
         self.plays_file_gcs = plays_file_gcs
         self.training_bucket_name = training_bucket
         self.max_workers = max_workers
+        self.skip_if_exists = skip_if_exists
         
         # Initialize GCS client
         self.storage_client = storage.Client()
@@ -351,9 +353,115 @@ class ClipExtractorJob:
             result["failed_angles"] = ["ALL"]
             return result
     
+    def _check_existing_clips(self) -> Dict[str, Any]:
+        """Check if clips already exist for this game."""
+        logger.info(f"🔍 Checking for existing clips for game: {self.game_id}")
+        
+        try:
+            # List all blobs in the clips directory
+            clips_prefix = f"{self.clips_dir}/"
+            blobs = list(self.training_bucket.list_blobs(prefix=clips_prefix))
+            
+            # Filter out directories (blobs ending with /)
+            clip_files = [blob for blob in blobs if not blob.name.endswith('/') and blob.name.endswith('.mp4')]
+            
+            clips_count = len(clip_files)
+            total_needed = 0
+            
+            # Calculate how many clips we should have
+            for play in self.plays:
+                training_angles = self._get_training_angles(play["angle"])
+                total_needed += len(training_angles)
+            
+            logger.info(f"📊 Found {clips_count} existing clips, need {total_needed} total clips")
+            
+            # Check if we have enough clips (allowing for some tolerance)
+            clips_exist = clips_count >= total_needed * 0.9  # 90% threshold
+            
+            if clips_exist:
+                logger.info(f"✅ Sufficient clips already exist ({clips_count}/{total_needed})")
+                return {
+                    "clips_exist": True,
+                    "existing_count": clips_count,
+                    "needed_count": total_needed,
+                    "clip_files": [blob.name for blob in clip_files[:10]]  # Show first 10
+                }
+            else:
+                logger.info(f"⚠️ Not enough clips exist ({clips_count}/{total_needed}), will extract")
+                return {
+                    "clips_exist": False,
+                    "existing_count": clips_count,
+                    "needed_count": total_needed
+                }
+                
+        except Exception as e:
+            logger.warning(f"Could not check existing clips: {e}, proceeding with extraction")
+            return {"clips_exist": False, "existing_count": 0, "needed_count": 0}
+
+    def _ensure_training_data_files(self):
+        """Ensure training data files exist even when skipping clip extraction."""
+        logger.info("📝 Ensuring training data files are properly formatted...")
+        
+        try:
+            # Import the training data formatting module
+            from pathlib import Path
+            import sys
+            
+            # Add scripts directory to path
+            scripts_dir = Path(__file__).parent.parent.parent / "scripts" / "training"
+            sys.path.insert(0, str(scripts_dir))
+            
+            # Import and run the training data formatter
+            from format_training_data import create_training_data_from_clips
+            
+            # Generate training data from existing clips
+            result = create_training_data_from_clips(
+                game_id=self.game_id,
+                training_bucket_name=self.training_bucket_name
+            )
+            
+            if result.get("success", False):
+                logger.info(f"✅ Training data files ensured: {result.get('files_created', [])}")
+            else:
+                logger.warning(f"⚠️ Could not ensure training data files: {result.get('error', 'Unknown error')}")
+                
+        except Exception as e:
+            logger.warning(f"⚠️ Could not ensure training data files: {e}")
+            logger.info("💡 Training data will be created by the workflow's format step")
+
     def extract_all_clips(self) -> Dict[str, Any]:
-        """Extract clips for all plays using parallel processing."""
-        logger.info(f"🚀 Starting parallel clip extraction for {len(self.plays)} plays")
+        """Extract clips for all plays using parallel processing with smart skipping."""
+        logger.info(f"🚀 Starting intelligent clip extraction for {len(self.plays)} plays")
+        
+        # Check if clips already exist (if enabled)
+        if self.skip_if_exists:
+            clip_check = self._check_existing_clips()
+            
+            if clip_check.get("clips_exist", False):
+                logger.info(f"🎯 Clips already exist, skipping extraction and ensuring training data is ready")
+                
+                # Ensure training data files are created even if clips exist
+                self._ensure_training_data_files()
+                
+                # Return summary of existing clips
+                return {
+                    "success": True,
+                    "game_id": self.game_id,
+                    "total_plays": len(self.plays),
+                    "total_clips_needed": clip_check["needed_count"],
+                    "clips_extracted": 0,  # None extracted this run
+                    "clips_existing": clip_check["existing_count"],
+                    "clips_failed": 0,
+                    "success_rate": 100.0,
+                    "clips_location": f"gs://{self.training_bucket_name}/{self.clips_dir}/",
+                    "skipped_extraction": True,
+                    "message": "Clips already exist, skipped extraction"
+                }
+            
+            logger.info(f"🎬 Proceeding with clip extraction ({clip_check['existing_count']} existing)")
+        else:
+            logger.info(f"🎬 Skip check disabled, proceeding with extraction")
+            clip_check = {"existing_count": 0}
         
         success_count = 0
         fail_count = 0

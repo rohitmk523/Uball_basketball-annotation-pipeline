@@ -36,6 +36,7 @@ def main():
         game_id = os.environ.get("GAME_ID")
         plays_file_gcs = os.environ.get("PLAYS_FILE_GCS")  # GCS URI to plays JSON
         gcs_training_bucket = os.environ.get("GCS_TRAINING_BUCKET")
+        skip_if_exists = os.environ.get("SKIP_IF_EXISTS", "true").lower() == "true"
         
         if not game_id:
             raise ValueError("GAME_ID environment variable is required")
@@ -48,12 +49,14 @@ def main():
         logger.info(f"  Game ID: {game_id}")
         logger.info(f"  Plays File: {plays_file_gcs}")
         logger.info(f"  Training Bucket: {gcs_training_bucket}")
+        logger.info(f"  Skip if exists: {skip_if_exists}")
         
         # Initialize and run the job
         extractor = ClipExtractorJob(
             game_id=game_id,
             plays_file_gcs=plays_file_gcs,
-            training_bucket=gcs_training_bucket
+            training_bucket=gcs_training_bucket,
+            skip_if_exists=skip_if_exists
         )
         
         # Execute the extraction

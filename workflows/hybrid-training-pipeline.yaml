@@ -44,30 +44,7 @@ main:
           data: '${"✅ Export completed: " + string(export_result.body.total_plays) + " plays exported"}'
           severity: INFO
 
-    # Step 2: Check if clips already exist
-    - check_existing_clips:
-        call: check_clips_exist
-        args:
-          game_id: ${game_id}
-          expected_plays: ${export_result.body.total_plays}
-          project_id: ${project_id}
-        result: clips_status
-
-    - decide_clip_extraction:
-        switch:
-          - condition: ${clips_status.clips_exist}
-            next: log_clips_exist
-          - condition: true
-            next: extract_clips_job
-
-    - log_clips_exist:
-        call: sys.log
-        args:
-          data: '${"✅ Clips already exist: " + string(clips_status.clips_count) + " clips found, skipping extraction"}'
-          severity: INFO
-        next: find_training_files
-
-    # Step 2: Cloud Run Job - Extract video clips
+    # Step 2: Cloud Run Job - Extract video clips (with smart skipping)
     - extract_clips_job:
         call: googleapis.run.v1.namespaces.jobs.create
         args:
@@ -96,6 +73,8 @@ main:
                           value: "uball-training-data"
                         - name: GCS_VIDEO_BUCKET
                           value: "uball-videos-production"
+                        - name: SKIP_IF_EXISTS
+                          value: "true"
                         resources:
                           limits:
                             memory: 16Gi
@@ -868,60 +847,6 @@ get_deployed_model_from_endpoint:
               model_name: "gemini-2.5-flash"
               is_base_model: true
 
-# Subworkflow to check if clips already exist for a game
-check_clips_exist:
-  params: [game_id, expected_plays, project_id]
-  steps:
-    - log_checking_clips:
-        call: sys.log
-        args:
-          data: '${"🔍 Checking if clips exist for game: " + game_id}'
-          severity: INFO
-
-    # Check clips directory in GCS
-    - list_clips:
-        call: http.get
-        args:
-          url: '${"https://storage.googleapis.com/storage/v1/b/uball-training-data/o?prefix=clips/" + game_id + "/"}'
-          auth:
-            type: OAuth2
-        result: clips_response
-
-    - count_clips:
-        switch:
-          - condition: ${"items" in clips_response.body}
-            assign:
-              - clips_count: ${len(clips_response.body.items)}
-          - condition: true
-            assign:
-              - clips_count: 0
-
-    - check_clips_match:
-        switch:
-          - condition: ${clips_count >= expected_plays}
-            steps:
-              - log_clips_found:
-                  call: sys.log
-                  args:
-                    data: '${"✅ Found " + string(clips_count) + " clips for " + string(expected_plays) + " plays"}'
-                    severity: INFO
-              - return_clips_exist:
-                  return:
-                    clips_exist: true
-                    clips_count: ${clips_count}
-                    expected_plays: ${expected_plays}
-          - condition: true
-            steps:
-              - log_clips_missing:
-                  call: sys.log
-                  args:
-                    data: '${"⚠️ Only found " + string(clips_count) + " clips, need " + string(expected_plays) + " - will extract"}'
-                    severity: INFO
-              - return_clips_missing:
-                  return:
-                    clips_exist: false
-                    clips_count: ${clips_count}
-                    expected_plays: ${expected_plays}
 
 # Subworkflow to find the latest training files for a game
 find_latest_training_files:
