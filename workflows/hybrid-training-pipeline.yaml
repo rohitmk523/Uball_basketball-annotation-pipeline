@@ -130,7 +130,20 @@ main:
           data: '${"✅ Training data formatted successfully"}'
           severity: INFO
 
-    # Step 4: Direct Vertex AI Model Fine-tuning
+    # Step 4: Determine base model for incremental training
+    - get_base_model:
+        call: get_latest_trained_model
+        args:
+          project_id: ${project_id}
+        result: base_model_info
+
+    - log_base_model:
+        call: sys.log
+        args:
+          data: '${"🔄 Using base model: " + base_model_info.model_name + " for incremental training"}'
+          severity: INFO
+
+    # Step 4: Direct Vertex AI Model Fine-tuning (Incremental)
     - create_tuning_job:
         call: http.post
         args:
@@ -140,16 +153,15 @@ main:
           headers:
             Content-Type: "application/json"
           body:
-            displayName: '${"basketball-model-" + game_id + "-" + timestamp}'
-            baseModel: "gemini-1.5-flash-001"
+            baseModel: ${base_model_info.model_name}  # Use latest trained model or base gemini
             supervisedTuningSpec:
-              trainingDatasetUri: "gs://uball-training-data/datasets/training_d6ba2cbb-da84-4614-82fc-ff58ba12d5ab_20251020_052353.jsonl"
-              validationDatasetUri: "gs://uball-training-data/datasets/validation_d6ba2cbb-da84-4614-82fc-ff58ba12d5ab_20251020_052353.jsonl"
+              trainingDatasetUri: '${"gs://uball-training-data/datasets/video_training_" + game_id + "_" + text.replace_all(string(sys.now()), ".", "") + ".jsonl"}'
+              validationDatasetUri: '${"gs://uball-training-data/datasets/video_validation_" + game_id + "_" + text.replace_all(string(sys.now()), ".", "") + ".jsonl"}'
               hyperParameters:
-                epochCount: "5"
-                learningRateMultiplier: "1.0"
-                adapterSize: "ADAPTER_SIZE_EIGHT"
-            tunedModelDisplayName: '${"basketball-model-" + game_id + "-" + timestamp}'
+                epochCount: "3"  # Fewer epochs for incremental training
+                learningRateMultiplier: "0.5"  # Lower learning rate for fine-tuning
+                adapterSize: "ADAPTER_SIZE_ONE"
+            tunedModelDisplayName: '${"basketball-model-incremental-" + game_id + "-" + timestamp}'
         result: tuning_job_response
 
     - log_tuning_job_created:
@@ -174,11 +186,55 @@ main:
           data: '${"✅ Vertex AI model fine-tuning completed successfully"}'
           severity: INFO
 
+    # Step 5: Count games trained and determine version
+    - count_trained_games:
+        call: get_trained_games_count
+        args:
+          project_id: ${project_id}
+        result: games_count
+
+    - determine_model_version:
+        assign:
+          - total_games: ${games_count.total + 1}  # Include current game
+          - version_number: ${int(total_games / 5) + 1}  # v2 at 5 games, v3 at 10, etc.
+          - model_display_name: '${"basketball-model-v" + string(version_number) + "-" + string(total_games) + "games"}'
+
+    - log_versioning_info:
+        call: sys.log
+        args:
+          data: '${"📊 Model versioning: " + string(total_games) + " games trained, creating " + model_display_name}'
+          severity: INFO
+
+    # Step 6: Deploy model to persistent endpoint
+    - deploy_to_persistent_endpoint:
+        call: deploy_model_to_endpoint
+        args:
+          tuned_model_name: ${tuning_status.tuned_model}
+          model_display_name: ${model_display_name}
+          project_id: ${project_id}
+          region: ${region}
+        result: deployment_result
+
+    - log_deployment_success:
+        call: sys.log
+        args:
+          data: '${"🚀 Model deployed to persistent endpoint: " + deployment_result.endpoint_name}'
+          severity: INFO
+
+    # Step 7: Update game count in storage
+    - update_trained_games_count:
+        call: store_trained_games_count
+        args:
+          project_id: ${project_id}
+          total_games: ${total_games}
+          game_id: ${game_id}
+          model_name: ${model_display_name}
+
     # Success completion
     - log_pipeline_success:
         call: sys.log
         args:
-          data: '${"🎉 Hybrid training pipeline completed successfully for game: " + game_id}'
+          data: '${"🎉 Continuous training pipeline completed successfully for game: " + game_id}'
           severity: INFO
 
     - return_success:
@@ -190,8 +246,13 @@ main:
           extract_job_name: ${extract_job.metadata.name}
           tuning_job_name: ${tuning_job_response.body.name}
           tuned_model: ${tuning_status.tuned_model}
+          deployed_model: ${model_display_name}
+          total_games_trained: ${total_games}
+          model_version: ${version_number}
+          persistent_endpoint: ${deployment_result.endpoint_name}
+          endpoint_url: ${deployment_result.endpoint_url}
           vertex_ai_console: '${"https://console.cloud.google.com/vertex-ai/models?project=" + project_id}'
-          message: "Hybrid training pipeline completed successfully with Vertex AI fine-tuning"
+          message: "Continuous training pipeline completed with automatic deployment"
 
     # Error handling
     - export_failed:
@@ -438,13 +499,13 @@ monitor_tuning_job:
           - log_model_info:
               call: sys.log
               args:
-                data: '${"🎯 Fine-tuned model: " + tuning_status.body.tunedModel.name}'
+                data: '${"🎯 Fine-tuned model: " + tuning_status.body.tuned_model.name}'
                 severity: INFO
           - return_success:
               return: 
                 success: true
                 state: ${tuning_status.body.state}
-                tuned_model: ${tuning_status.body.tunedModel.name}
+                tuned_model: ${tuning_status.body.tuned_model.name}
                 tuning_job: ${job_name}
 
     - tuning_failed:
@@ -476,3 +537,306 @@ monitor_tuning_job:
                 severity: ERROR
           - raise_timeout:
               raise: '${"Tuning job timed out after " + string(timeout_minutes) + " minutes"}'
+
+# Subworkflow to get count of games trained so far
+get_trained_games_count:
+  params: [project_id]
+  steps:
+    - get_count_from_storage:
+        try:
+          call: http.get
+          args:
+            url: '${"https://storage.googleapis.com/uball-training-data/metadata/games_count.json"}'
+          result: count_response
+        except:
+          as: e
+          steps:
+            - log_no_count_file:
+                call: sys.log
+                args:
+                  data: "📝 No games count file found, starting from 0"
+                  severity: INFO
+            - return_zero_count:
+                return:
+                  total: 0
+                  games: []
+
+    - parse_count:
+        assign:
+          - count_data: ${count_response.body}
+        
+    - return_count:
+        return:
+          total: ${count_data.total}
+          games: ${count_data.games}
+
+# Subworkflow to store updated games count
+store_trained_games_count:
+  params: [project_id, total_games, game_id, model_name]
+  steps:
+    - get_existing_data:
+        call: get_trained_games_count
+        args:
+          project_id: ${project_id}
+        result: existing_data
+
+    - build_updated_data:
+        assign:
+          - updated_games: ${existing_data.games}
+          - current_time: ${string(int(sys.now()))}
+          
+    - add_current_game:
+        assign:
+          - updated_games: ${list.concat(updated_games, [{"game_id": game_id, "model_name": model_name, "timestamp": current_time}])}
+
+    - create_metadata:
+        assign:
+          - metadata: 
+              total: ${total_games}
+              games: ${updated_games}
+              last_updated: ${current_time}
+
+    - upload_to_storage:
+        call: http.put
+        args:
+          url: "https://storage.googleapis.com/uball-training-data/metadata/games_count.json"
+          headers:
+            Content-Type: "application/json"
+          body: ${metadata}
+          auth:
+            type: OAuth2
+
+    - log_count_updated:
+        call: sys.log
+        args:
+          data: '${"📊 Updated games count: " + string(total_games) + " total games"}'
+          severity: INFO
+
+# Subworkflow to deploy model to persistent endpoint
+deploy_model_to_endpoint:
+  params: [tuned_model_name, model_display_name, project_id, region]
+  steps:
+    - log_deployment_start:
+        call: sys.log
+        args:
+          data: '${"🚀 Deploying model " + model_display_name + " to persistent endpoint"}'
+          severity: INFO
+
+    # Check if persistent endpoint exists
+    - get_endpoints:
+        call: http.get
+        args:
+          url: '${"https://" + region + "-aiplatform.googleapis.com/v1/projects/" + project_id + "/locations/" + region + "/endpoints"}'
+          auth:
+            type: OAuth2
+        result: endpoints_response
+
+    - find_persistent_endpoint:
+        assign:
+          - persistent_endpoint: null
+          - endpoint_name: "basketball-annotation-endpoint"
+        
+    - check_for_existing_endpoint:
+        for:
+          value: endpoint
+          in: ${endpoints_response.body.endpoints}
+          steps:
+            - check_endpoint_name:
+                switch:
+                  - condition: ${endpoint.displayName == endpoint_name}
+                    assign:
+                      - persistent_endpoint: ${endpoint}
+
+    # Create endpoint if it doesn't exist
+    - create_endpoint_if_needed:
+        switch:
+          - condition: ${persistent_endpoint == null}
+            steps:
+              - create_persistent_endpoint:
+                  call: http.post
+                  args:
+                    url: '${"https://" + region + "-aiplatform.googleapis.com/v1/projects/" + project_id + "/locations/" + region + "/endpoints"}'
+                    auth:
+                      type: OAuth2
+                    headers:
+                      Content-Type: "application/json"
+                    body:
+                      displayName: ${endpoint_name}
+                      description: "Persistent endpoint for basketball annotation models"
+                  result: create_endpoint_response
+              
+              - assign_new_endpoint:
+                  assign:
+                    - persistent_endpoint: ${create_endpoint_response.body}
+
+              - log_endpoint_created:
+                  call: sys.log
+                  args:
+                    data: '${"✅ Created persistent endpoint: " + persistent_endpoint.name}'
+                    severity: INFO
+
+    # Deploy model to endpoint
+    - deploy_model:
+        call: http.post
+        args:
+          url: '${"https://" + region + "-aiplatform.googleapis.com/v1/" + persistent_endpoint.name + ":deployModel"}'
+          auth:
+            type: OAuth2
+          headers:
+            Content-Type: "application/json"
+          body:
+            deployedModel:
+              model: ${tuned_model_name}
+              displayName: ${model_display_name}
+              machineSpec:
+                machineType: "n1-standard-2"
+              minReplicaCount: 1
+              maxReplicaCount: 3
+            trafficSplit:
+              "0": 100  # Route 100% traffic to new model
+        result: deploy_response
+
+    - log_deployment_complete:
+        call: sys.log
+        args:
+          data: '${"✅ Model deployed successfully to persistent endpoint"}'
+          severity: INFO
+
+    # Format endpoint URL for API usage
+    - format_endpoint_url:
+        assign:
+          - endpoint_id: ${text.split(persistent_endpoint.name, "/")[-1]}
+          - endpoint_url: '${"projects/" + project_id + "/locations/" + region + "/endpoints/" + endpoint_id}'
+
+    - return_deployment_result:
+        return:
+          endpoint_name: ${persistent_endpoint.name}
+          endpoint_url: ${endpoint_url}
+          deployed_model_name: ${model_display_name}
+          success: true
+
+# Subworkflow to get the latest trained model for incremental training
+get_latest_trained_model:
+  params: [project_id]
+  steps:
+    - get_games_count:
+        call: get_trained_games_count
+        args:
+          project_id: ${project_id}
+        result: games_data
+
+    - determine_base_model:
+        switch:
+          - condition: ${games_data.total == 0}
+            # No games trained yet, use base Gemini model
+            steps:
+              - log_using_base_gemini:
+                  call: sys.log
+                  args:
+                    data: "🎯 First training - using base Gemini 2.5 Flash model"
+                    severity: INFO
+              - return_base_model:
+                  return:
+                    model_name: "gemini-2.5-flash"
+                    is_base_model: true
+                    games_trained: 0
+          - condition: true
+            # Use the latest trained model from the deployed endpoint
+            steps:
+              - get_latest_deployed_model:
+                  call: get_deployed_model_from_endpoint
+                  args:
+                    project_id: ${project_id}
+                  result: deployed_model
+              
+              - log_using_latest_model:
+                  call: sys.log
+                  args:
+                    data: '${"🔄 Incremental training - using latest model: " + deployed_model.model_name}'
+                    severity: INFO
+              
+              - return_latest_model:
+                  return:
+                    model_name: ${deployed_model.model_name}
+                    is_base_model: false
+                    games_trained: ${games_data.total}
+
+# Subworkflow to get the currently deployed model from persistent endpoint
+get_deployed_model_from_endpoint:
+  params: [project_id]
+  steps:
+    - get_endpoints:
+        call: http.get
+        args:
+          url: '${"https://us-central1-aiplatform.googleapis.com/v1/projects/" + project_id + "/locations/us-central1/endpoints"}'
+          auth:
+            type: OAuth2
+        result: endpoints_response
+
+    - find_basketball_endpoint:
+        assign:
+          - basketball_endpoint: null
+        
+    - search_for_endpoint:
+        for:
+          value: endpoint
+          in: ${endpoints_response.body.endpoints}
+          steps:
+            - check_endpoint_name:
+                switch:
+                  - condition: ${endpoint.displayName == "basketball-annotation-endpoint"}
+                    assign:
+                      - basketball_endpoint: ${endpoint}
+
+    - handle_no_endpoint:
+        switch:
+          - condition: ${basketball_endpoint == null}
+            steps:
+              - log_no_endpoint:
+                  call: sys.log
+                  args:
+                    data: "⚠️ No persistent endpoint found, using base Gemini model"
+                    severity: WARNING
+              - return_base_model_fallback:
+                  return:
+                    model_name: "gemini-2.5-flash"
+                    is_base_model: true
+
+    # Get deployed models from the endpoint
+    - get_deployed_models:
+        call: http.get
+        args:
+          url: '${"https://us-central1-aiplatform.googleapis.com/v1/" + basketball_endpoint.name + "/deployedModels"}'
+          auth:
+            type: OAuth2
+        result: deployed_models_response
+
+    - find_latest_model:
+        assign:
+          - latest_model: null
+          - latest_timestamp: 0
+
+    - search_deployed_models:
+        for:
+          value: deployed_model
+          in: ${deployed_models_response.body.deployedModels}
+          steps:
+            - check_model_timestamp:
+                switch:
+                  - condition: ${int(deployed_model.createTime) > latest_timestamp}
+                    assign:
+                      - latest_model: ${deployed_model}
+                      - latest_timestamp: ${int(deployed_model.createTime)}
+
+    - return_latest_deployed_model:
+        switch:
+          - condition: ${latest_model != null}
+            return:
+              model_name: ${latest_model.model}
+              is_base_model: false
+              deployed_model_id: ${latest_model.id}
+          - condition: true
+            # Fallback to base model if no deployed models found
+            return:
+              model_name: "gemini-2.5-flash"
+              is_base_model: true
