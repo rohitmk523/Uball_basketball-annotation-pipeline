@@ -44,6 +44,29 @@ main:
           data: '${"✅ Export completed: " + string(export_result.body.total_plays) + " plays exported"}'
           severity: INFO
 
+    # Step 2: Check if clips already exist
+    - check_existing_clips:
+        call: check_clips_exist
+        args:
+          game_id: ${game_id}
+          expected_plays: ${export_result.body.total_plays}
+          project_id: ${project_id}
+        result: clips_status
+
+    - decide_clip_extraction:
+        switch:
+          - condition: ${clips_status.clips_exist}
+            next: log_clips_exist
+          - condition: true
+            next: extract_clips_job
+
+    - log_clips_exist:
+        call: sys.log
+        args:
+          data: '${"✅ Clips already exist: " + string(clips_status.clips_count) + " clips found, skipping extraction"}'
+          severity: INFO
+        next: find_training_files
+
     # Step 2: Cloud Run Job - Extract video clips
     - extract_clips_job:
         call: googleapis.run.v1.namespaces.jobs.create
@@ -116,18 +139,18 @@ main:
           data: '${"✅ Clip extraction completed successfully"}'
           severity: INFO
 
-    # Step 3: Format training data (could be another job, but keeping it simple for now)
-    - format_training_data:
-        call: format_data_step
+    # Step 3: Find existing training data files
+    - find_training_files:
+        call: find_latest_training_files
         args:
           game_id: ${game_id}
           project_id: ${project_id}
-        result: format_result
+        result: training_files
 
-    - log_format_completion:
+    - log_training_files_found:
         call: sys.log
         args:
-          data: '${"✅ Training data formatted successfully"}'
+          data: '${"✅ Found training files: " + training_files.training_file}'
           severity: INFO
 
     # Step 4: Determine base model for incremental training
@@ -155,8 +178,8 @@ main:
           body:
             baseModel: ${base_model_info.model_name}  # Use latest trained model or base gemini
             supervisedTuningSpec:
-              trainingDatasetUri: '${"gs://uball-training-data/datasets/video_training_" + game_id + "_" + text.replace_all(string(sys.now()), ".", "") + ".jsonl"}'
-              validationDatasetUri: '${"gs://uball-training-data/datasets/video_validation_" + game_id + "_" + text.replace_all(string(sys.now()), ".", "") + ".jsonl"}'
+              trainingDatasetUri: ${training_files.training_file}
+              validationDatasetUri: ${training_files.validation_file}
               hyperParameters:
                 epochCount: "3"  # Fewer epochs for incremental training
                 learningRateMultiplier: "0.5"  # Lower learning rate for fine-tuning
@@ -844,3 +867,131 @@ get_deployed_model_from_endpoint:
             return:
               model_name: "gemini-2.5-flash"
               is_base_model: true
+
+# Subworkflow to check if clips already exist for a game
+check_clips_exist:
+  params: [game_id, expected_plays, project_id]
+  steps:
+    - log_checking_clips:
+        call: sys.log
+        args:
+          data: '${"🔍 Checking if clips exist for game: " + game_id}'
+          severity: INFO
+
+    # Check clips directory in GCS
+    - list_clips:
+        call: http.get
+        args:
+          url: '${"https://storage.googleapis.com/storage/v1/b/uball-training-data/o?prefix=clips/" + game_id + "/"}'
+          auth:
+            type: OAuth2
+        result: clips_response
+
+    - count_clips:
+        switch:
+          - condition: ${"items" in clips_response.body}
+            assign:
+              - clips_count: ${len(clips_response.body.items)}
+          - condition: true
+            assign:
+              - clips_count: 0
+
+    - check_clips_match:
+        switch:
+          - condition: ${clips_count >= expected_plays}
+            steps:
+              - log_clips_found:
+                  call: sys.log
+                  args:
+                    data: '${"✅ Found " + string(clips_count) + " clips for " + string(expected_plays) + " plays"}'
+                    severity: INFO
+              - return_clips_exist:
+                  return:
+                    clips_exist: true
+                    clips_count: ${clips_count}
+                    expected_plays: ${expected_plays}
+          - condition: true
+            steps:
+              - log_clips_missing:
+                  call: sys.log
+                  args:
+                    data: '${"⚠️ Only found " + string(clips_count) + " clips, need " + string(expected_plays) + " - will extract"}'
+                    severity: INFO
+              - return_clips_missing:
+                  return:
+                    clips_exist: false
+                    clips_count: ${clips_count}
+                    expected_plays: ${expected_plays}
+
+# Subworkflow to find the latest training files for a game
+find_latest_training_files:
+  params: [game_id, project_id]
+  steps:
+    - log_finding_files:
+        call: sys.log
+        args:
+          data: '${"🔍 Finding training files for game: " + game_id}'
+          severity: INFO
+
+    # List training files
+    - list_training_files:
+        call: http.get
+        args:
+          url: '${"https://storage.googleapis.com/storage/v1/b/uball-training-data/o?prefix=datasets/video_training_" + game_id}'
+          auth:
+            type: OAuth2
+        result: training_response
+
+    # List validation files  
+    - list_validation_files:
+        call: http.get
+        args:
+          url: '${"https://storage.googleapis.com/storage/v1/b/uball-training-data/o?prefix=datasets/video_validation_" + game_id}'
+          auth:
+            type: OAuth2
+        result: validation_response
+
+    - find_latest_files:
+        switch:
+          - condition: ${"items" in training_response.body and "items" in validation_response.body}
+            assign:
+              - training_files: ${training_response.body.items}
+              - validation_files: ${validation_response.body.items}
+          - condition: true
+            assign:
+              - training_files: []
+              - validation_files: []
+
+    - check_files_exist:
+        switch:
+          - condition: ${len(training_files) > 0 and len(validation_files) > 0}
+            steps:
+              # Sort by timeCreated and get the latest
+              - get_latest_training:
+                  assign:
+                    - latest_training: ${training_files[-1]}  # Last item is most recent
+                    - latest_validation: ${validation_files[-1]}
+                    - training_file_uri: '${"gs://uball-training-data/" + latest_training.name}'
+                    - validation_file_uri: '${"gs://uball-training-data/" + latest_validation.name}'
+
+              - log_files_found:
+                  call: sys.log
+                  args:
+                    data: '${"✅ Found training files: " + latest_training.name}'
+                    severity: INFO
+
+              - return_files:
+                  return:
+                    training_file: ${training_file_uri}
+                    validation_file: ${validation_file_uri}
+                    training_name: ${latest_training.name}
+                    validation_name: ${latest_validation.name}
+          - condition: true
+            steps:
+              - log_no_files:
+                  call: sys.log
+                  args:
+                    data: '${"❌ No training files found for game: " + game_id}'
+                    severity: ERROR
+              - raise_no_files:
+                  raise: '${"No training files found for game: " + game_id}'
