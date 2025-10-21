@@ -499,13 +499,13 @@ monitor_tuning_job:
           - log_model_info:
               call: sys.log
               args:
-                data: '${"🎯 Fine-tuned model: " + tuning_status.body.tuned_model.name}'
+                data: '${"🎯 Fine-tuned model: " + tuning_status.body.tunedModel.name}'
                 severity: INFO
           - return_success:
               return: 
                 success: true
                 state: ${tuning_status.body.state}
-                tuned_model: ${tuning_status.body.tuned_model.name}
+                tuned_model: ${tuning_status.body.tunedModel.name}
                 tuning_job: ${job_name}
 
     - tuning_failed:
