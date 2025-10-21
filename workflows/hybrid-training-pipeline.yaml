@@ -587,7 +587,11 @@ store_trained_games_count:
           
     - add_current_game:
         assign:
-          - updated_games: ${list.concat(updated_games, [{"game_id": game_id, "model_name": model_name, "timestamp": current_time}])}
+          - new_game_entry:
+              game_id: ${game_id}
+              model_name: ${model_name}
+              timestamp: ${current_time}
+          - updated_games: ${list.concat(updated_games, [new_game_entry])}
 
     - create_metadata:
         assign:
