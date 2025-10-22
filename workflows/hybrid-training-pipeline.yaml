@@ -118,6 +118,12 @@ main:
           data: '${"✅ Clip extraction completed successfully"}'
           severity: INFO
 
+    # Brief wait to ensure GCS indexing is complete
+    - wait_for_gcs_indexing:
+        call: sys.sleep
+        args:
+          seconds: 5
+
     # Step 3: Find existing training data files
     - find_training_files:
         call: find_latest_training_files
@@ -681,7 +687,7 @@ deploy_model_to_endpoint:
                     data: '${"✅ Created persistent endpoint: " + persistent_endpoint.name}'
                     severity: INFO
 
-    # Deploy model to endpoint
+    # Deploy model to endpoint using correct Vertex AI API structure
     - deploy_model:
         call: http.post
         args:
@@ -694,10 +700,11 @@ deploy_model_to_endpoint:
             deployedModel:
               model: ${tuned_model_name}
               displayName: ${model_display_name}
-              machineSpec:
-                machineType: "n1-standard-2"
-              minReplicaCount: 1
-              maxReplicaCount: 3
+              dedicatedResources:
+                machineSpec:
+                  machineType: "n1-standard-2"
+                minReplicaCount: 1
+                maxReplicaCount: 3
             trafficSplit:
               "0": 100  # Route 100% traffic to new model
         result: deploy_response
@@ -711,7 +718,8 @@ deploy_model_to_endpoint:
     # Format endpoint URL for API usage
     - format_endpoint_url:
         assign:
-          - endpoint_id: ${text.split(persistent_endpoint.name, "/")[-1]}
+          - endpoint_parts: ${text.split(persistent_endpoint.name, "/")}
+          - endpoint_id: ${endpoint_parts[len(endpoint_parts) - 1]}
           - endpoint_url: '${"projects/" + project_id + "/locations/" + region + "/endpoints/" + endpoint_id}'
 
     - return_deployment_result:
@@ -862,7 +870,7 @@ find_latest_training_files:
     - list_training_files:
         call: http.get
         args:
-          url: '${"https://storage.googleapis.com/storage/v1/b/uball-training-data/o?prefix=datasets/video_training_" + game_id}'
+          url: '${"https://storage.googleapis.com/storage/v1/b/uball-training-data/o?prefix=games%2F" + game_id + "%2Fvideo_training_"}'
           auth:
             type: OAuth2
         result: training_response
@@ -871,31 +879,44 @@ find_latest_training_files:
     - list_validation_files:
         call: http.get
         args:
-          url: '${"https://storage.googleapis.com/storage/v1/b/uball-training-data/o?prefix=datasets/video_validation_" + game_id}'
+          url: '${"https://storage.googleapis.com/storage/v1/b/uball-training-data/o?prefix=games%2F" + game_id + "%2Fvideo_validation_"}'
           auth:
             type: OAuth2
         result: validation_response
 
-    - find_latest_files:
+    - extract_training_files:
         switch:
-          - condition: ${"items" in training_response.body and "items" in validation_response.body}
+          - condition: ${"items" in training_response.body}
             assign:
               - training_files: ${training_response.body.items}
-              - validation_files: ${validation_response.body.items}
           - condition: true
             assign:
               - training_files: []
+    
+    - extract_validation_files:
+        switch:
+          - condition: ${"items" in validation_response.body}
+            assign:
+              - validation_files: ${validation_response.body.items}
+          - condition: true
+            assign:
               - validation_files: []
+
+    - log_file_counts:
+        call: sys.log
+        args:
+          data: '${"📊 Found " + string(len(training_files)) + " training files, " + string(len(validation_files)) + " validation files"}'
+          severity: INFO
 
     - check_files_exist:
         switch:
           - condition: ${len(training_files) > 0 and len(validation_files) > 0}
             steps:
-              # Sort by timeCreated and get the latest
+              # Get the latest files (they have timestamps in filenames, so we'll use the first available)
               - get_latest_training:
                   assign:
-                    - latest_training: ${training_files[-1]}  # Last item is most recent
-                    - latest_validation: ${validation_files[-1]}
+                    - latest_training: ${training_files[0]}  # Use first available
+                    - latest_validation: ${validation_files[0]}  # Use first available  
                     - training_file_uri: '${"gs://uball-training-data/" + latest_training.name}'
                     - validation_file_uri: '${"gs://uball-training-data/" + latest_validation.name}'
 

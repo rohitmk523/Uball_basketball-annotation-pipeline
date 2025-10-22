@@ -398,36 +398,171 @@ class ClipExtractorJob:
             logger.warning(f"Could not check existing clips: {e}, proceeding with extraction")
             return {"clips_exist": False, "existing_count": 0, "needed_count": 0}
 
-    def _ensure_training_data_files(self):
-        """Ensure training data files exist even when skipping clip extraction."""
-        logger.info("📝 Ensuring training data files are properly formatted...")
+    def _create_vertex_ai_jsonl_files(self) -> Dict[str, Any]:
+        """Create Vertex AI training JSONL files from clips and plays data."""
+        logger.info("📝 Creating Vertex AI training JSONL files from clips...")
         
         try:
-            # Import the training data formatting module
-            from pathlib import Path
-            import sys
+            import datetime
+            import random
             
-            # Add scripts directory to path
-            scripts_dir = Path(__file__).parent.parent.parent / "scripts" / "training"
-            sys.path.insert(0, str(scripts_dir))
+            # Split plays into training (80%) and validation (20%)
+            random.seed(42)  # For reproducible splits
+            shuffled_plays = self.plays.copy()
+            random.shuffle(shuffled_plays)
             
-            # Import and run the training data formatter
-            from format_training_data import create_training_data_from_clips
+            split_idx = int(len(shuffled_plays) * 0.8)
+            training_plays = shuffled_plays[:split_idx]
+            validation_plays = shuffled_plays[split_idx:]
             
-            # Generate training data from existing clips
-            result = create_training_data_from_clips(
-                game_id=self.game_id,
-                training_bucket_name=self.training_bucket_name
-            )
+            logger.info(f"📊 Split: {len(training_plays)} training plays, {len(validation_plays)} validation plays")
             
-            if result.get("success", False):
-                logger.info(f"✅ Training data files ensured: {result.get('files_created', [])}")
-            else:
-                logger.warning(f"⚠️ Could not ensure training data files: {result.get('error', 'Unknown error')}")
-                
+            # Create training and validation datasets
+            training_examples = self._create_jsonl_examples(training_plays, "training")
+            validation_examples = self._create_jsonl_examples(validation_plays, "validation")
+            
+            # Upload JSONL files to GCS
+            timestamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+            training_file = f"video_training_{self.game_id}_{timestamp}.jsonl"
+            validation_file = f"video_validation_{self.game_id}_{timestamp}.jsonl"
+            
+            training_path = f"{self.game_dir}/{training_file}"
+            validation_path = f"{self.game_dir}/{validation_file}"
+            
+            # Upload training file
+            self._upload_jsonl_to_gcs(training_examples, training_path)
+            logger.info(f"✅ Uploaded training file: gs://{self.training_bucket_name}/{training_path}")
+            
+            # Upload validation file  
+            self._upload_jsonl_to_gcs(validation_examples, validation_path)
+            logger.info(f"✅ Uploaded validation file: gs://{self.training_bucket_name}/{validation_path}")
+            
+            return {
+                "success": True,
+                "training_file": f"gs://{self.training_bucket_name}/{training_path}",
+                "validation_file": f"gs://{self.training_bucket_name}/{validation_path}",
+                "training_examples": len(training_examples),
+                "validation_examples": len(validation_examples)
+            }
+            
         except Exception as e:
-            logger.warning(f"⚠️ Could not ensure training data files: {e}")
-            logger.info("💡 Training data will be created by the workflow's format step")
+            logger.error(f"❌ Failed to create JSONL files: {e}")
+            return {
+                "success": False,
+                "error": str(e)
+            }
+    
+    def _create_jsonl_examples(self, plays: List[Dict[str, Any]], dataset_type: str) -> List[Dict[str, Any]]:
+        """Create JSONL examples in Vertex AI format for given plays."""
+        examples = []
+        
+        for play in plays:
+            try:
+                play_examples = self._create_single_jsonl_example(play)
+                if play_examples:
+                    examples.extend(play_examples)  # Add all examples from this play
+            except Exception as e:
+                logger.warning(f"⚠️ Failed to create JSONL example for play {play.get('id')}: {e}")
+                continue
+        
+        logger.info(f"✅ Created {len(examples)} {dataset_type} examples")
+        return examples
+    
+    def _create_single_jsonl_example(self, play: Dict[str, Any]) -> List[Dict[str, Any]]:
+        """Create JSONL examples in Vertex AI format (one per camera angle)."""
+        play_id = play["id"]
+        play_angle = play["angle"]
+        
+        # Get training angles for this play
+        training_angles = self._get_training_angles(play_angle)
+        
+        examples = []
+        
+        # Create separate example for each camera angle (Vertex AI limit: 1 video per example)
+        for angle in training_angles:
+            clip_uri = f"gs://{self.training_bucket_name}/{self.clips_dir}/{play_id}_{angle}.mp4"
+        
+            # Basketball-specific prompt based on your classification system
+            prompt_text = f"""⚠️ CRITICAL: This is UBALL basketball with a 4-POINT LINE. 4-point shots are VALID and DIFFERENT from 3-point shots.
+
+Analyze this basketball game video from {angle} camera angle and identify the play with its events.
+
+This is a {angle} camera view that provides {'wide court view and team formation context' if 'FAR' in angle else 'close-up details of player numbers and jerseys'}.
+
+For the play, provide:
+1. timestamp_seconds: The time in the video when the play occurs (number)
+2. classification: The primary event type (FG_MAKE, FG_MISS, 3PT_MAKE, 3PT_MISS, 4PT_MAKE, 4PT_MISS, FOUL, REBOUND, ASSIST, etc.)
+3. note: A detailed description of what happened (string)
+4. player_a: The primary player involved (format: "Player #X (Color Team)")
+5. player_b: Secondary player if applicable (format: "Player #X (Color Team)")
+6. events: Array of all events in the play, each with:
+   - label: Event type (same options as classification)
+   - playerA: Player identifier (format: "Player #X (Color Team)")
+   - playerB: Secondary player if applicable
+
+Return a JSON array with the single play. Be precise with timestamps and identify all basketball events."""
+
+            # Build expected output (model response) from play data
+            expected_response = {
+                "timestamp_seconds": play.get("timestamp_seconds"),
+                "classification": play.get("classification"),
+                "note": play.get("note"),
+                "player_a": play.get("player_a"),
+                "player_b": play.get("player_b"),
+                "events": play.get("events", [])
+            }
+            
+            # Create Vertex AI format example with single video
+            example = {
+                "contents": [
+                    {
+                        "role": "user", 
+                        "parts": [
+                            {
+                                "fileData": {
+                                    "fileUri": clip_uri,
+                                    "mimeType": "video/mp4"
+                                }
+                            },
+                            {"text": prompt_text}
+                        ]
+                    },
+                    {
+                        "role": "model",
+                        "parts": [
+                            {
+                                "text": json.dumps([expected_response])  # Array with single play
+                            }
+                        ]
+                    }
+                ],
+                "generationConfig": {
+                    "mediaResolution": "MEDIA_RESOLUTION_MEDIUM"
+                }
+            }
+            
+            examples.append(example)
+        
+        return examples
+    
+    def _upload_jsonl_to_gcs(self, examples: List[Dict[str, Any]], gcs_path: str):
+        """Upload JSONL examples to GCS.""" 
+        import tempfile
+        
+        # Create temporary JSONL file
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False) as temp_file:
+            for example in examples:
+                temp_file.write(json.dumps(example) + '\n')
+            temp_file_path = temp_file.name
+        
+        try:
+            # Upload to GCS
+            blob = self.training_bucket.blob(gcs_path)
+            blob.upload_from_filename(temp_file_path)
+            logger.debug(f"✅ Uploaded JSONL file: gs://{self.training_bucket_name}/{gcs_path}")
+        finally:
+            # Clean up temporary file
+            Path(temp_file_path).unlink()
 
     def extract_all_clips(self) -> Dict[str, Any]:
         """Extract clips for all plays using parallel processing with smart skipping."""
@@ -438,13 +573,13 @@ class ClipExtractorJob:
             clip_check = self._check_existing_clips()
             
             if clip_check.get("clips_exist", False):
-                logger.info(f"🎯 Clips already exist, skipping extraction and ensuring training data is ready")
+                logger.info(f"🎯 Clips already exist, skipping extraction and creating training JSONL files")
                 
-                # Ensure training data files are created even if clips exist
-                self._ensure_training_data_files()
+                # Create training data files from existing clips
+                jsonl_result = self._create_vertex_ai_jsonl_files()
                 
-                # Return summary of existing clips
-                return {
+                # Return summary of existing clips + JSONL creation
+                result = {
                     "success": True,
                     "game_id": self.game_id,
                     "total_plays": len(self.plays),
@@ -457,6 +592,19 @@ class ClipExtractorJob:
                     "skipped_extraction": True,
                     "message": "Clips already exist, skipped extraction"
                 }
+                
+                # Add JSONL creation results
+                if jsonl_result.get("success"):
+                    result["training_file"] = jsonl_result["training_file"]
+                    result["validation_file"] = jsonl_result["validation_file"]
+                    result["training_examples"] = jsonl_result["training_examples"]
+                    result["validation_examples"] = jsonl_result["validation_examples"]
+                    result["message"] = "Clips existed, created training JSONL files"
+                else:
+                    result["jsonl_error"] = jsonl_result.get("error")
+                    result["message"] = "Clips existed, but JSONL creation failed"
+                
+                return result
             
             logger.info(f"🎬 Proceeding with clip extraction ({clip_check['existing_count']} existing)")
         else:
@@ -498,6 +646,12 @@ class ClipExtractorJob:
         # Save game metadata
         self._save_game_metadata(success_count, fail_count, total_clips_needed)
         
+        # Create Vertex AI training JSONL files if we have successful clips
+        jsonl_result = None
+        if success_count > 0:
+            logger.info(f"🔄 Creating Vertex AI training JSONL files...")
+            jsonl_result = self._create_vertex_ai_jsonl_files()
+        
         # Final summary
         logger.info(f"🎉 CLIP EXTRACTION COMPLETE")
         logger.info(f"📊 Total plays processed: {len(self.plays)}")
@@ -508,7 +662,8 @@ class ClipExtractorJob:
             success_rate = (success_count / total_clips_needed) * 100
             logger.info(f"📊 Success rate: {success_rate:.1f}%")
         
-        return {
+        # Build result
+        result = {
             "success": True,
             "game_id": self.game_id,
             "total_plays": len(self.plays),
@@ -518,3 +673,17 @@ class ClipExtractorJob:
             "success_rate": (success_count / total_clips_needed * 100) if total_clips_needed > 0 else 0,
             "clips_location": f"gs://{self.training_bucket_name}/{self.clips_dir}/"
         }
+        
+        # Add JSONL creation results
+        if jsonl_result:
+            if jsonl_result.get("success"):
+                result["training_file"] = jsonl_result["training_file"]
+                result["validation_file"] = jsonl_result["validation_file"]
+                result["training_examples"] = jsonl_result["training_examples"]
+                result["validation_examples"] = jsonl_result["validation_examples"]
+                logger.info(f"✅ Created training files: {jsonl_result['training_examples']} + {jsonl_result['validation_examples']} examples")
+            else:
+                result["jsonl_error"] = jsonl_result.get("error")
+                logger.warning(f"⚠️ JSONL creation failed: {jsonl_result.get('error')}")
+        
+        return result
