@@ -26,7 +26,7 @@ training_jobs: Dict[str, Dict] = {}
 
 # Models
 class TrainingRequest(BaseModel):
-    game_id: str
+    game_ids: list[str]  # Changed to support multiple games
     force_retrain: bool = False
 
 class TrainingResponse(BaseModel):
@@ -38,7 +38,7 @@ class TrainingJobStatus(BaseModel):
     job_id: str
     status: str  # "queued", "running", "completed", "failed"
     message: str
-    game_id: str
+    game_ids: list[str]  # Changed to support multiple games
     mode: str
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
@@ -206,23 +206,27 @@ async def run_local_training(job_id: str, game_id: str):
         training_jobs[job_id]["completed_at"] = datetime.now()
         logger.error(f"[{job_id}] Training failed: {e}")
 
-# Cloud training execution (hybrid mode)
-async def run_cloud_training(job_id: str, game_id: str):
-    """Run training pipeline using Hybrid Cloud Workflows (Functions + Jobs)."""
+# Cloud training execution (basketball pipeline)
+async def run_cloud_training(job_id: str, game_ids: list[str]):
+    """Run training pipeline using Basketball Training Pipeline with multi-game support."""
     try:
         training_jobs[job_id]["status"] = "running"
         training_jobs[job_id]["started_at"] = datetime.now()
-        update_job_progress(job_id, "hybrid", 0, 4, "Triggering hybrid cloud training pipeline")
+        update_job_progress(job_id, "basketball", 0, 4, f"Triggering basketball training pipeline for {len(game_ids)} games")
         
-        logger.info(f"[{job_id}] Triggering hybrid cloud training for game {game_id}")
+        logger.info(f"[{job_id}] Triggering basketball training for games: {game_ids}")
         
-        # Use hybrid workflow instead of the old one
-        workflow_name = "hybrid-training-pipeline"
+        # Use basketball-training-pipeline workflow 
+        workflow_name = "basketball-training-pipeline"
+        
+        # Create game_ids array for the workflow
+        import json
+        workflow_data = {"game_ids": game_ids}
         
         # Execute gcloud workflows run command
         result = await asyncio.create_subprocess_exec(
             "gcloud", "workflows", "run", workflow_name,
-            "--data", f'{{"game_id": "{game_id}"}}',
+            "--data", json.dumps(workflow_data),
             "--location", settings.TRAINING_WORKFLOW_LOCATION,
             "--format", "json",
             stdout=asyncio.subprocess.PIPE,
@@ -231,10 +235,9 @@ async def run_cloud_training(job_id: str, game_id: str):
         stdout, stderr = await result.communicate()
         
         if result.returncode != 0:
-            raise Exception(f"Hybrid workflow execution failed: {stderr.decode()}")
+            raise Exception(f"Basketball training workflow execution failed: {stderr.decode()}")
         
         # Parse workflow execution ID from output
-        import json
         workflow_result = json.loads(stdout.decode())
         execution_id = workflow_result.get("name", "").split("/")[-1]
         
@@ -243,20 +246,20 @@ async def run_cloud_training(job_id: str, game_id: str):
         training_jobs[job_id]["workflow_name"] = workflow_name
         
         # Start monitoring the workflow in the background
-        asyncio.create_task(monitor_hybrid_workflow(job_id, execution_id, game_id))
+        asyncio.create_task(monitor_basketball_workflow(job_id, execution_id, game_ids))
         
-        logger.info(f"[{job_id}] Hybrid workflow triggered successfully: {execution_id}")
+        logger.info(f"[{job_id}] Basketball training workflow triggered successfully: {execution_id}")
         
     except Exception as e:
         training_jobs[job_id]["status"] = "failed"
-        training_jobs[job_id]["message"] = f"Hybrid training failed: {str(e)}"
+        training_jobs[job_id]["message"] = f"Basketball training failed: {str(e)}"
         training_jobs[job_id]["error"] = str(e)
         training_jobs[job_id]["completed_at"] = datetime.now()
-        logger.error(f"[{job_id}] Hybrid training failed: {e}")
+        logger.error(f"[{job_id}] Basketball training failed: {e}")
 
-# New function to monitor hybrid workflow progress
-async def monitor_hybrid_workflow(job_id: str, execution_id: str, game_id: str):
-    """Monitor hybrid workflow execution and update progress."""
+# Monitor basketball workflow progress
+async def monitor_basketball_workflow(job_id: str, execution_id: str, game_ids: list[str]):
+    """Monitor basketball training workflow execution and update progress."""
     try:
         logger.info(f"[{job_id}] Starting workflow monitoring for execution: {execution_id}")
         
@@ -268,7 +271,7 @@ async def monitor_hybrid_workflow(job_id: str, execution_id: str, game_id: str):
                 # Check workflow status
                 result = await asyncio.create_subprocess_exec(
                     "gcloud", "workflows", "executions", "describe", execution_id,
-                    "--workflow", "hybrid-training-pipeline",
+                    "--workflow", "basketball-training-pipeline",
                     "--location", settings.TRAINING_WORKFLOW_LOCATION,
                     "--format", "json",
                     stdout=asyncio.subprocess.PIPE,
@@ -288,7 +291,8 @@ async def monitor_hybrid_workflow(job_id: str, execution_id: str, game_id: str):
                 
                 # Update progress based on workflow state and steps
                 if state == "SUCCEEDED":
-                    update_job_progress(job_id, "completed", 4, 4, f"🎉 Hybrid training completed successfully for game {game_id}")
+                    games_str = f"{len(game_ids)} games: {', '.join(game_ids[:2])}{'...' if len(game_ids) > 2 else ''}"
+                    update_job_progress(job_id, "completed", 4, 4, f"🎉 Basketball training completed successfully for {games_str}")
                     training_jobs[job_id]["status"] = "completed"
                     training_jobs[job_id]["completed_at"] = datetime.now()
                     logger.info(f"[{job_id}] Workflow completed successfully")
@@ -381,19 +385,21 @@ async def start_training_pipeline(
     background_tasks: BackgroundTasks
 ):
     """
-    Start the complete training pipeline for a game.
+    Start the complete basketball training pipeline for multiple games.
     Mode depends on TRAINING_MODE setting (local/cloud).
     """
     try:
         job_id = f"train-{uuid.uuid4().hex[:8]}"
         mode = settings.TRAINING_MODE
         
+        games_str = f"{len(request.game_ids)} games: {', '.join(request.game_ids[:2])}{'...' if len(request.game_ids) > 2 else ''}"
+        
         # Initialize job tracking
         training_jobs[job_id] = {
             "job_id": job_id,
             "status": "queued",
-            "message": f"Training job queued (mode: {mode})",
-            "game_id": request.game_id,
+            "message": f"Basketball training job queued for {games_str} (mode: {mode})",
+            "game_ids": request.game_ids,
             "mode": mode,
             "steps_completed": 0,
             "total_steps": 4,
@@ -407,23 +413,24 @@ async def start_training_pipeline(
         
         # Execute based on mode
         if mode == "local":
-            background_tasks.add_task(run_local_training, job_id, request.game_id)
+            # Local mode currently supports single game - we'll use the first one
+            background_tasks.add_task(run_local_training, job_id, request.game_ids[0])
         elif mode in ["cloud", "hybrid"]:
-            # Both cloud and hybrid use the new hybrid workflow
-            background_tasks.add_task(run_cloud_training, job_id, request.game_id)
+            # Cloud mode supports multiple games
+            background_tasks.add_task(run_cloud_training, job_id, request.game_ids)
         else:
             raise ValueError(f"Invalid training mode: {mode}. Use 'local', 'cloud', or 'hybrid'")
         
-        logger.info(f"✓ Started training job {job_id} for game {request.game_id} (mode: {mode})")
+        logger.info(f"✓ Started basketball training job {job_id} for {games_str} (mode: {mode})")
         
         return TrainingResponse(
             job_id=job_id,
-            message=f"Training pipeline started in {mode} mode",
+            message=f"Basketball training pipeline started for {games_str} in {mode} mode",
             mode=mode
         )
         
     except Exception as e:
-        logger.error(f"Error starting training pipeline: {e}")
+        logger.error(f"Error starting basketball training pipeline: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @router.get("/status/{job_id}", response_model=TrainingJobStatus)
@@ -473,7 +480,7 @@ async def get_training_progress(job_id: str):
     # Enhanced progress response
     progress_info = {
         "job_id": job_id,
-        "game_id": job_data["game_id"],
+        "game_ids": job_data.get("game_ids", [job_data.get("game_id")]),  # Support both old and new format
         "status": job_data["status"],
         "current_step": job_data.get("current_step", "unknown"),
         "steps_completed": job_data["steps_completed"],

@@ -33,6 +33,7 @@ ENV/
 .env.dev
 .env.prod
 .env.hybrid
+.env.migration
 
 
 # IDE
