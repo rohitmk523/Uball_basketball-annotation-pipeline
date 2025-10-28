@@ -195,6 +195,210 @@ Each basketball play is converted to Vertex AI format:
 
 ---
 
+## 📦 S3 to GCS Migration
+
+### **Migration Overview**
+
+Before training, you may need to migrate basketball game videos from S3 to GCS. The migration script handles this seamlessly without quality loss.
+
+```
+📂 Migration Flow:
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│   S3 Bucket     │───▶│  Migration      │───▶│   GCS Bucket    │
+│   (Source)      │    │  Script         │    │  (Training)     │
+└─────────────────┘    └─────────────────┘    └─────────────────┘
+s3://uball-videos-     Direct transfer       gs://uball-videos-
+production/Games/      (no quality loss)     production/Games/
+09-22-2025/game1/                            d6ba2cbb-da84-4614/
+```
+
+### **Setup Migration Environment**
+
+```bash
+# 1. Install migration dependencies
+pip install -r requirements-migration.txt
+
+# 2. Configure credentials (create .env.migration file)
+cp .env.migration.example .env.migration
+# Edit with your actual credentials:
+```
+
+**.env.migration** (create this file):
+```bash
+# S3 to GCS Migration Environment Variables
+# AWS Configuration
+AWS_ACCESS_KEY_ID=your_aws_access_key_here
+AWS_SECRET_ACCESS_KEY=your_aws_secret_key_here
+AWS_S3_BUCKET=uball-videos-production
+AWS_S3_REGION=us-east-1
+
+# GCP Configuration
+GOOGLE_APPLICATION_CREDENTIALS=path/to/your/service-account-key.json
+GCS_BUCKET=uball-videos-production
+```
+
+### **Migration Usage**
+
+#### **Basic Migration**
+```bash
+# Migrate a single game
+python scripts/migrate_s3_to_gcs.py \
+  --s3-path "Games/09-22-2025/game1/" \
+  --game-id "d6ba2cbb-da84-4614-82fc-ff58ba12d5ab"
+```
+
+#### **Advanced Migration with Custom Parameters**
+```bash
+# Full parameter migration
+python scripts/migrate_s3_to_gcs.py \
+  --s3-path "Games/09-22-2025/game1/" \
+  --game-id "d6ba2cbb-da84-4614-82fc-ff58ba12d5ab" \
+  --aws-access-key "AKIA..." \
+  --aws-secret-key "secret..." \
+  --aws-bucket "uball-videos-production" \
+  --aws-region "us-east-1" \
+  --gcp-service-account "/path/to/service-account.json" \
+  --gcs-bucket "uball-videos-production"
+```
+
+#### **Environment Variable Migration**
+```bash
+# Using environment variables (recommended)
+export AWS_ACCESS_KEY_ID="your_access_key"
+export AWS_SECRET_ACCESS_KEY="your_secret_key"
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account.json"
+
+python scripts/migrate_s3_to_gcs.py \
+  --s3-path "Games/09-22-2025/game1/" \
+  --game-id "d6ba2cbb-da84-4614-82fc-ff58ba12d5ab"
+```
+
+### **Migration Examples**
+
+#### **Example 1: Single Game Migration**
+```bash
+# Source: s3://uball-videos-production/Games/09-22-2025/game1/
+# Target: gs://uball-videos-production/Games/d6ba2cbb-da84-4614-82fc-ff58ba12d5ab/
+
+python scripts/migrate_s3_to_gcs.py \
+  --s3-path "Games/09-22-2025/game1/" \
+  --game-id "d6ba2cbb-da84-4614-82fc-ff58ba12d5ab"
+
+# Output:
+# 🚀 Starting migration for game: d6ba2cbb-da84-4614-82fc-ff58ba12d5ab
+# 🔍 Listing objects in s3://uball-videos-production/Games/09-22-2025/game1/
+# 📊 Found 15 objects in S3
+# 🔄 Migrating: s3://uball-videos-production/Games/09-22-2025/game1/FAR_LEFT.mp4
+# ✅ Successfully migrated: Games/d6ba2cbb-da84-4614-82fc-ff58ba12d5ab/FAR_LEFT.mp4
+# 🎉 Migration completed!
+# 📊 Results: 15/15 files migrated (100.0%)
+```
+
+#### **Example 2: Multiple Game Migration (Batch)**
+```bash
+# Create a batch migration script
+cat > migrate_multiple_games.sh << 'EOF'
+#!/bin/bash
+
+# Array of games to migrate
+declare -A games=(
+  ["Games/09-22-2025/game1/"]="d6ba2cbb-da84-4614-82fc-ff58ba12d5ab"
+  ["Games/09-22-2025/game2/"]="a1b2c3d4-e5f6-7890-abcd-ef1234567890"
+  ["Games/09-23-2025/game3/"]="f2e3d4c5-b6a7-8901-cdef-234567890abc"
+)
+
+for s3_path in "${!games[@]}"; do
+  game_id="${games[$s3_path]}"
+  echo "🔄 Migrating $s3_path -> $game_id"
+  
+  python scripts/migrate_s3_to_gcs.py \
+    --s3-path "$s3_path" \
+    --game-id "$game_id"
+  
+  if [ $? -eq 0 ]; then
+    echo "✅ Successfully migrated $game_id"
+  else
+    echo "❌ Failed to migrate $game_id"
+  fi
+  echo "---"
+done
+EOF
+
+chmod +x migrate_multiple_games.sh
+./migrate_multiple_games.sh
+```
+
+### **Migration Features**
+
+#### **🔄 What Gets Migrated**
+- All video files (`.mp4`, `.mov`, etc.)
+- Preserves original file structure within game directory
+- Maintains file metadata and content type
+- Zero quality loss (byte-for-byte copy)
+
+#### **📊 Migration Output**
+```json
+{
+  "success": true,
+  "game_id": "d6ba2cbb-da84-4614-82fc-ff58ba12d5ab",
+  "source_path": "s3://uball-videos-production/Games/09-22-2025/game1/",
+  "destination_path": "gs://uball-videos-production/Games/d6ba2cbb-da84-4614-82fc-ff58ba12d5ab/",
+  "total_files": 15,
+  "migrated_files": 15,
+  "failed_files": 0,
+  "success_rate": 100.0,
+  "migrated_list": [
+    {
+      "source": "s3://uball-videos-production/Games/09-22-2025/game1/FAR_LEFT.mp4",
+      "destination": "gs://uball-videos-production/Games/d6ba2cbb-da84-4614-82fc-ff58ba12d5ab/FAR_LEFT.mp4"
+    }
+  ]
+}
+```
+
+#### **🔧 Migration Troubleshooting**
+
+**AWS Credentials Error:**
+```bash
+# Error: AWS credentials required
+# Solution: Set environment variables
+export AWS_ACCESS_KEY_ID="your_key"
+export AWS_SECRET_ACCESS_KEY="your_secret"
+```
+
+**GCP Authentication Error:**
+```bash
+# Error: GCP service account not found
+# Solution: Set service account path
+export GOOGLE_APPLICATION_CREDENTIALS="/path/to/service-account.json"
+```
+
+**No Objects Found:**
+```bash
+# Error: No objects found in S3 path
+# Solution: Check S3 path format (should end with /)
+--s3-path "Games/09-22-2025/game1/"  # ✅ Correct
+--s3-path "Games/09-22-2025/game1"   # ❌ Missing trailing slash
+```
+
+### **Post-Migration: Training**
+
+After migration, use the basketball training pipeline:
+
+```bash
+# Train with migrated game
+curl -X POST "http://localhost:8000/api/training/pipeline" \
+  -H "Content-Type: application/json" \
+  -d '{"game_ids": ["d6ba2cbb-da84-4614-82fc-ff58ba12d5ab"]}'
+
+# Train with multiple migrated games (cumulative training)
+curl -X POST "http://localhost:8000/api/training/pipeline" \
+  -H "Content-Type: application/json" \
+  -d '{"game_ids": ["d6ba2cbb-da84-4614-82fc-ff58ba12d5ab", "a1b2c3d4-e5f6-7890-abcd-ef1234567890"]}'
+```
+
+---
+
 ## 🚀 Quick Start
 
 ### **Development Mode**
@@ -216,7 +420,7 @@ uvicorn app.main:app --reload --port 8000
 # 4. Test training pipeline
 curl -X POST "http://localhost:8000/api/training/pipeline" \
   -H "Content-Type: application/json" \
-  -d '{"game_id": "your-game-id"}'
+  -d '{"game_ids": ["your-game-id"]}'
 ```
 
 ### **Production Deployment**
@@ -237,10 +441,11 @@ cp .env.hybrid .env
 ## 📋 API Endpoints
 
 ### **Training Pipeline**
-- `POST /api/training/pipeline` - Start training for a game
+- `POST /api/training/pipeline` - Start training for multiple games (cumulative)
 - `GET /api/training/progress/{job_id}` - Real-time progress tracking
 - `GET /api/training/status/{job_id}` - Job status and details
 - `GET /api/training/config` - Current configuration
+- `GET /api/training/jobs` - List all training jobs
 
 ### **Annotation Pipeline**  
 - `POST /api/annotate` - Process game video
