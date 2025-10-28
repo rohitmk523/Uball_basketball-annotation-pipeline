@@ -21,6 +21,7 @@ from typing import List, Optional
 import boto3
 from google.cloud import storage
 from botocore.exceptions import ClientError, NoCredentialsError
+from tqdm import tqdm
 
 
 # Configure logging
@@ -109,18 +110,24 @@ class S3ToGCSMigrator:
             logger.error(f"❌ Error listing S3 objects: {e}")
             raise
     
-    def migrate_file(self, s3_key: str, gcs_destination: str) -> bool:
+    def migrate_file(self, s3_key: str, gcs_destination: str, progress_bar: tqdm = None) -> bool:
         """
-        Migrate a single file from S3 to GCS.
+        Migrate a single file from S3 to GCS with progress tracking.
         
         Args:
             s3_key: S3 object key
             gcs_destination: GCS destination path
+            progress_bar: tqdm progress bar instance
             
         Returns:
             True if migration successful, False otherwise
         """
         try:
+            # Update progress bar description
+            filename = s3_key.split('/')[-1]
+            if progress_bar:
+                progress_bar.set_description(f"📥 Downloading {filename}")
+            
             logger.info(f"🔄 Migrating: s3://{self.aws_bucket}/{s3_key} → gs://{self.gcs_bucket}/{gcs_destination}")
             
             # Download from S3 to memory
@@ -131,16 +138,27 @@ class S3ToGCSMigrator:
             content_type = response.get('ContentType', 'application/octet-stream')
             content_length = len(file_content)
             
+            # Update progress bar for upload
+            if progress_bar:
+                progress_bar.set_description(f"📤 Uploading {filename}")
+            
             logger.info(f"📋 File info: {content_length} bytes, type: {content_type}")
             
             # Upload to GCS
             blob = self.gcs_bucket_obj.blob(gcs_destination)
             blob.upload_from_string(file_content, content_type=content_type)
             
+            # Update progress bar completion
+            if progress_bar:
+                progress_bar.set_description(f"✅ Completed {filename}")
+                progress_bar.update(1)
+            
             logger.info(f"✅ Successfully migrated: {gcs_destination}")
             return True
             
         except Exception as e:
+            if progress_bar:
+                progress_bar.set_description(f"❌ Failed {filename}")
             logger.error(f"❌ Failed to migrate {s3_key}: {e}")
             return False
     
@@ -175,33 +193,46 @@ class S3ToGCSMigrator:
                 'failed_files': 0
             }
         
-        # Migrate each file
+        # Migrate each file with progress bar
         migrated_count = 0
         failed_count = 0
         migrated_files = []
         failed_files = []
         
-        for s3_key in s3_objects:
-            # Get relative path within the game directory
-            relative_path = s3_key[len(s3_path):]
+        # Create progress bar
+        print(f"\n🚀 Starting migration of {len(s3_objects)} files...")
+        with tqdm(total=len(s3_objects), 
+                  desc="🔄 Initializing", 
+                  unit="file",
+                  bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} files [{elapsed}<{remaining}]",
+                  colour="green") as pbar:
             
-            # Skip if empty (shouldn't happen but safety check)
-            if not relative_path:
-                continue
+            for s3_key in s3_objects:
+                # Get relative path within the game directory
+                relative_path = s3_key[len(s3_path):]
+                
+                # Skip if empty (shouldn't happen but safety check)
+                if not relative_path:
+                    continue
+                
+                # Build GCS destination path
+                gcs_destination = f"Games/{game_id}/{relative_path}"
+                
+                # Migrate the file with progress tracking
+                if self.migrate_file(s3_key, gcs_destination, pbar):
+                    migrated_count += 1
+                    migrated_files.append({
+                        'source': f"s3://{self.aws_bucket}/{s3_key}",
+                        'destination': f"gs://{self.gcs_bucket}/{gcs_destination}"
+                    })
+                else:
+                    failed_count += 1
+                    failed_files.append(s3_key)
+                    # Still update progress bar for failed files
+                    pbar.update(1)
             
-            # Build GCS destination path
-            gcs_destination = f"Games/{game_id}/{relative_path}"
-            
-            # Migrate the file
-            if self.migrate_file(s3_key, gcs_destination):
-                migrated_count += 1
-                migrated_files.append({
-                    'source': f"s3://{self.aws_bucket}/{s3_key}",
-                    'destination': f"gs://{self.gcs_bucket}/{gcs_destination}"
-                })
-            else:
-                failed_count += 1
-                failed_files.append(s3_key)
+            # Final progress bar update
+            pbar.set_description("🎉 Migration completed!")
         
         # Summary
         total_files = len(s3_objects)
