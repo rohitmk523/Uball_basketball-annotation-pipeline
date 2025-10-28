@@ -110,21 +110,49 @@ class S3ToGCSMigrator:
             logger.error(f"❌ Error listing S3 objects: {e}")
             raise
     
-    def migrate_file(self, s3_key: str, gcs_destination: str, progress_bar: tqdm = None) -> bool:
+    def file_exists_in_gcs(self, gcs_path: str) -> bool:
         """
-        Migrate a single file from S3 to GCS with progress tracking.
+        Check if a file already exists in GCS.
+        
+        Args:
+            gcs_path: GCS file path to check
+            
+        Returns:
+            True if file exists, False otherwise
+        """
+        try:
+            blob = self.gcs_bucket_obj.blob(gcs_path)
+            return blob.exists()
+        except Exception as e:
+            logger.warning(f"⚠️ Could not check if file exists in GCS: {e}")
+            return False
+
+    def migrate_file(self, s3_key: str, gcs_destination: str, progress_bar: tqdm = None, skip_existing: bool = True) -> dict:
+        """
+        Migrate a single file from S3 to GCS with progress tracking and smart skipping.
         
         Args:
             s3_key: S3 object key
             gcs_destination: GCS destination path
             progress_bar: tqdm progress bar instance
+            skip_existing: Skip files that already exist in GCS
             
         Returns:
-            True if migration successful, False otherwise
+            Dictionary with migration result: {"success": bool, "skipped": bool, "error": str}
         """
+        filename = s3_key.split('/')[-1]
+        
         try:
+            # Check if file already exists in GCS
+            if skip_existing and self.file_exists_in_gcs(gcs_destination):
+                if progress_bar:
+                    progress_bar.set_description(f"⏭️ Skipping {filename} (already exists)")
+                    progress_bar.update(1)
+                
+                logger.info(f"⏭️ Skipping {filename}: Already exists in GCS")
+                return {"success": True, "skipped": True, "error": None}
+            
             # Update progress bar description
-            filename = s3_key.split('/')[-1]
             if progress_bar:
                 progress_bar.set_description(f"📥 Downloading {filename}")
             
@@ -140,7 +168,7 @@ class S3ToGCSMigrator:
             
             # Update progress bar for upload
             if progress_bar:
-                progress_bar.set_description(f"📤 Uploading {filename}")
+                progress_bar.set_description(f"📤 Uploading {filename} ({content_length/1024/1024:.1f}MB)")
             
             logger.info(f"📋 File info: {content_length} bytes, type: {content_type}")
             
@@ -154,15 +182,16 @@ class S3ToGCSMigrator:
                 progress_bar.update(1)
             
             logger.info(f"✅ Successfully migrated: {gcs_destination}")
-            return True
+            return {"success": True, "skipped": False, "error": None}
             
         except Exception as e:
             if progress_bar:
                 progress_bar.set_description(f"❌ Failed {filename}")
+                progress_bar.update(1)
             logger.error(f"❌ Failed to migrate {s3_key}: {e}")
-            return False
+            return {"success": False, "skipped": False, "error": str(e)}
     
-    def migrate_game(self, s3_path: str, game_id: str) -> dict:
+    def migrate_game(self, s3_path: str, game_id: str, skip_existing: bool = True) -> dict:
         """
         Migrate entire game from S3 to GCS.
         
@@ -193,14 +222,17 @@ class S3ToGCSMigrator:
                 'failed_files': 0
             }
         
-        # Migrate each file with progress bar
+        # Migrate each file with progress bar and smart skipping
         migrated_count = 0
+        skipped_count = 0
         failed_count = 0
         migrated_files = []
+        skipped_files = []
         failed_files = []
         
         # Create progress bar
         print(f"\n🚀 Starting migration of {len(s3_objects)} files...")
+        print("⚡ Smart skip enabled: Files already in GCS will be skipped")
         with tqdm(total=len(s3_objects), 
                   desc="🔄 Initializing", 
                   unit="file",
@@ -218,31 +250,46 @@ class S3ToGCSMigrator:
                 # Build GCS destination path
                 gcs_destination = f"Games/{game_id}/{relative_path}"
                 
-                # Migrate the file with progress tracking
-                if self.migrate_file(s3_key, gcs_destination, pbar):
-                    migrated_count += 1
-                    migrated_files.append({
-                        'source': f"s3://{self.aws_bucket}/{s3_key}",
-                        'destination': f"gs://{self.gcs_bucket}/{gcs_destination}"
-                    })
+                # Migrate the file with progress tracking and skip logic
+                result = self.migrate_file(s3_key, gcs_destination, pbar, skip_existing=skip_existing)
+                
+                if result["success"]:
+                    if result["skipped"]:
+                        skipped_count += 1
+                        skipped_files.append({
+                            'source': f"s3://{self.aws_bucket}/{s3_key}",
+                            'destination': f"gs://{self.gcs_bucket}/{gcs_destination}",
+                            'reason': 'already_exists'
+                        })
+                    else:
+                        migrated_count += 1
+                        migrated_files.append({
+                            'source': f"s3://{self.aws_bucket}/{s3_key}",
+                            'destination': f"gs://{self.gcs_bucket}/{gcs_destination}"
+                        })
                 else:
                     failed_count += 1
-                    failed_files.append(s3_key)
-                    # Still update progress bar for failed files
-                    pbar.update(1)
+                    failed_files.append({
+                        'file': s3_key,
+                        'error': result["error"]
+                    })
             
             # Final progress bar update
             pbar.set_description("🎉 Migration completed!")
         
         # Summary
         total_files = len(s3_objects)
-        success_rate = (migrated_count / total_files * 100) if total_files > 0 else 0
+        completed_files = migrated_count + skipped_count
+        success_rate = (completed_files / total_files * 100) if total_files > 0 else 0
         
         logger.info(f"🎉 Migration completed!")
-        logger.info(f"📊 Results: {migrated_count}/{total_files} files migrated ({success_rate:.1f}%)")
+        logger.info(f"📊 Results: {migrated_count} migrated + {skipped_count} skipped = {completed_files}/{total_files} files processed ({success_rate:.1f}%)")
+        
+        if skipped_count > 0:
+            logger.info(f"⏭️ Skipped {skipped_count} files (already exist in GCS)")
         
         if failed_files:
-            logger.warning(f"⚠️ Failed files: {failed_files}")
+            logger.warning(f"⚠️ Failed files: {[f['file'] for f in failed_files]}")
         
         return {
             'success': failed_count == 0,
@@ -251,9 +298,11 @@ class S3ToGCSMigrator:
             'destination_path': f"gs://{self.gcs_bucket}/Games/{game_id}/",
             'total_files': total_files,
             'migrated_files': migrated_count,
+            'skipped_files': skipped_count,
             'failed_files': failed_count,
             'success_rate': success_rate,
             'migrated_list': migrated_files,
+            'skipped_list': skipped_files,
             'failed_list': failed_files
         }
 
@@ -269,6 +318,7 @@ def main():
     parser.add_argument('--aws-region', default='us-east-1', help='AWS region')
     parser.add_argument('--gcp-service-account', help='Path to GCP service account JSON file')
     parser.add_argument('--gcs-bucket', default='uball-videos-production', help='GCS bucket name')
+    parser.add_argument('--force', action='store_true', help='Force migration even if files already exist in GCS')
     
     args = parser.parse_args()
     
@@ -307,7 +357,8 @@ def main():
         )
         
         # Perform migration
-        result = migrator.migrate_game(args.s3_path, args.game_id)
+        skip_existing = not args.force  # If --force is used, don't skip existing files
+        result = migrator.migrate_game(args.s3_path, args.game_id, skip_existing=skip_existing)
         
         # Print final result
         if result['success']:
