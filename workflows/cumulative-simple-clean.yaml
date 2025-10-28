@@ -1,0 +1,253 @@
+# Simplified Cumulative Training Pipeline - Clean Version
+main:
+  params: [args]
+  steps:
+    - init:
+        assign:
+          - game_ids: ${args.game_ids}
+          - project_id: "refined-circuit-474617-s8"
+          - region: "us-central1"
+          - timestamp: ${string(int(sys.now()))}
+          - execution_dir: ${"cumulative-execution-" + timestamp}
+          - base_model: "gemini-2.5-flash"
+          - model_prefix: "basketball-flash"
+
+    - log_start:
+        call: sys.log
+        args:
+          data: '${"🚀 Starting cumulative training for " + string(len(game_ids)) + " games"}'
+          severity: INFO
+
+    # Combine all JSONL files (assuming they exist)
+    - set_game_variables:
+        switch:
+          - condition: ${len(game_ids) > 1}
+            assign:
+              - game_id_1: ${game_ids[0]}
+              - game_id_2: ${game_ids[1]}
+          - condition: true
+            assign:
+              - game_id_1: ${game_ids[0]}
+              - game_id_2: ""
+
+    - combine_files:
+        call: googleapis.run.v1.namespaces.jobs.create
+        args:
+          parent: '${"namespaces/" + project_id}'
+          location: ${region}
+          body:
+            apiVersion: run.googleapis.com/v1
+            kind: Job
+            metadata:
+              name: '${"combine-" + timestamp}'
+            spec:
+              template:
+                spec:
+                  parallelism: 1
+                  taskCount: 1
+                  template:
+                    spec:
+                      containers:
+                      - image: "gcr.io/google.com/cloudsdktool/cloud-sdk:latest"
+                        command: ["/bin/bash"]
+                        args:
+                          - "-c"
+                          - |
+                            echo "🚀 Combining JSONL files..."
+                            
+                            # Create execution directory
+                            gsutil -m mkdir -p "gs://uball-training-data/${EXECUTION_DIR}/"
+                            
+                            # Initialize combined files
+                            echo "" > /tmp/combined_training.jsonl
+                            echo "" > /tmp/combined_validation.jsonl
+                            
+                            # Process first game
+                            if [ -n "$GAME_ID_1" ]; then
+                              echo "📂 Processing game: $GAME_ID_1"
+                              gsutil -m mkdir -p "gs://uball-training-data/${EXECUTION_DIR}/${GAME_ID_1}/"
+                              gsutil -m cp -r "gs://uball-training-data/games/${GAME_ID_1}/*" "gs://uball-training-data/${EXECUTION_DIR}/${GAME_ID_1}/" 2>/dev/null || true
+                              
+                              # Combine training files
+                              gsutil ls "gs://uball-training-data/games/$GAME_ID_1/video_training_*.jsonl" | head -1 | xargs -I {} gsutil cp {} /tmp/game1_training.jsonl 2>/dev/null || true
+                              if [ -f /tmp/game1_training.jsonl ]; then
+                                cat /tmp/game1_training.jsonl >> /tmp/combined_training.jsonl
+                              fi
+                              
+                              # Combine validation files  
+                              gsutil ls "gs://uball-training-data/games/$GAME_ID_1/video_validation_*.jsonl" | head -1 | xargs -I {} gsutil cp {} /tmp/game1_validation.jsonl 2>/dev/null || true
+                              if [ -f /tmp/game1_validation.jsonl ]; then
+                                cat /tmp/game1_validation.jsonl >> /tmp/combined_validation.jsonl
+                              fi
+                            fi
+                            
+                            # Process second game if provided
+                            if [ -n "$GAME_ID_2" ]; then
+                              echo "📂 Processing game: $GAME_ID_2"
+                              gsutil -m mkdir -p "gs://uball-training-data/${EXECUTION_DIR}/${GAME_ID_2}/"
+                              gsutil -m cp -r "gs://uball-training-data/games/${GAME_ID_2}/*" "gs://uball-training-data/${EXECUTION_DIR}/${GAME_ID_2}/" 2>/dev/null || true
+                              
+                              # Combine training files
+                              gsutil ls "gs://uball-training-data/games/$GAME_ID_2/video_training_*.jsonl" | head -1 | xargs -I {} gsutil cp {} /tmp/game2_training.jsonl 2>/dev/null || true
+                              if [ -f /tmp/game2_training.jsonl ]; then
+                                cat /tmp/game2_training.jsonl >> /tmp/combined_training.jsonl
+                              fi
+                              
+                              # Combine validation files  
+                              gsutil ls "gs://uball-training-data/games/$GAME_ID_2/video_validation_*.jsonl" | head -1 | xargs -I {} gsutil cp {} /tmp/game2_validation.jsonl 2>/dev/null || true
+                              if [ -f /tmp/game2_validation.jsonl ]; then
+                                cat /tmp/game2_validation.jsonl >> /tmp/combined_validation.jsonl
+                              fi
+                            fi
+                            
+                            # Upload combined files
+                            gsutil cp /tmp/combined_training.jsonl "gs://uball-training-data/${EXECUTION_DIR}/combined_training.jsonl"
+                            gsutil cp /tmp/combined_validation.jsonl "gs://uball-training-data/${EXECUTION_DIR}/combined_validation.jsonl"
+                            
+                            echo "✅ Combined files ready!"
+                        env:
+                        - name: EXECUTION_DIR
+                          value: ${execution_dir}
+                        - name: GAME_ID_1
+                          value: ${game_id_1}
+                        - name: GAME_ID_2
+                          value: ${game_id_2}
+                        resources:
+                          limits:
+                            memory: 4Gi
+                            cpu: "2"
+                      maxRetries: 3
+                      timeoutSeconds: "1800"
+        result: combine_job
+
+    - run_combine_job:
+        call: googleapis.run.v1.namespaces.jobs.run
+        args:
+          name: '${"namespaces/" + project_id + "/jobs/" + combine_job.metadata.name}'
+          location: ${region}
+        result: combine_execution
+
+    - wait_combine:
+        call: wait_job_complete
+        args:
+          execution_name: ${combine_execution.metadata.name}
+          project_id: ${project_id}
+
+    # Start Vertex AI tuning
+    - set_file_paths:
+        assign:
+          - training_file: '${"gs://uball-training-data/" + execution_dir + "/combined_training.jsonl"}'
+          - validation_file: '${"gs://uball-training-data/" + execution_dir + "/combined_validation.jsonl"}'
+    
+    - create_tuning_job:
+        call: http.post
+        args:
+          url: '${"https://" + region + "-aiplatform.googleapis.com/v1/projects/" + project_id + "/locations/" + region + "/tuningJobs"}'
+          auth:
+            type: OAuth2
+          headers:
+            Content-Type: "application/json"
+          body:
+            baseModel: ${base_model}
+            supervisedTuningSpec:
+              trainingDatasetUri: ${training_file}
+              validationDatasetUri: ${validation_file}
+              hyperParameters:
+                epochCount: "5"
+                learningRateMultiplier: "1.0"
+                adapterSize: "ADAPTER_SIZE_ONE"
+            tunedModelDisplayName: '${"" + model_prefix + "-cumulative-" + string(len(game_ids)) + "games-" + timestamp}'
+            description: '${"Cumulative training on " + string(len(game_ids)) + " games using " + base_model}'
+        result: tuning_response
+
+    - log_tuning_started:
+        call: sys.log
+        args:
+          data: '${"🤖 Started tuning job: " + tuning_response.body.name}'
+          severity: INFO
+
+    # Monitor tuning completion
+    - wait_tuning:
+        call: monitor_tuning
+        args:
+          job_name: ${tuning_response.body.name}
+
+    - log_success:
+        call: sys.log
+        args:
+          data: '${"🎉 Cumulative training completed for " + string(len(game_ids)) + " games!"}'
+          severity: INFO
+
+    - return_result:
+        return:
+          success: true
+          games_trained: ${game_ids}
+          total_games: ${len(game_ids)}
+          training_file: ${training_file}
+          validation_file: ${validation_file}
+          execution_directory: ${execution_dir}
+
+# Wait for job completion
+wait_job_complete:
+  params: [execution_name, project_id]
+  steps:
+    - poll_loop:
+        assign:
+          - iterations: 0
+          - max_iterations: 120  # 30s * 120 = 60 minutes
+    - check_status:
+        call: googleapis.run.v1.namespaces.executions.get
+        args:
+          name: '${"namespaces/" + project_id + "/executions/" + execution_name}'
+          location: us-central1
+        result: status
+    - evaluate_status:
+        switch:
+          - condition: ${len(status.status.conditions) > 0 and status.status.conditions[0].type == "Completed"}
+            return: ${status}
+          - condition: ${len(status.status.conditions) > 0 and status.status.conditions[0].type == "Failed"}
+            raise: '${"Execution failed: " + status.status.conditions[0].message}'
+          - condition: ${iterations >= max_iterations}
+            raise: "Execution timed out"
+    - wait_and_retry:
+        call: sys.sleep
+        args:
+          seconds: 30
+    - increment_and_continue:
+        assign:
+          - iterations: ${iterations + 1}
+        next: check_status
+
+# Monitor tuning job
+monitor_tuning:
+  params: [job_name]
+  steps:
+    - poll_loop:
+        assign:
+          - iterations: 0
+          - max_iterations: 480  # 1 minute * 480 = 8 hours
+    - check_tuning:
+        call: http.get
+        args:
+          url: '${"https://us-central1-aiplatform.googleapis.com/v1/" + job_name}'
+          auth:
+            type: OAuth2
+        result: tuning_status
+    - evaluate_tuning:
+        switch:
+          - condition: ${tuning_status.body.state == "JOB_STATE_SUCCEEDED"}
+            return:
+              success: true
+              tuned_model: ${tuning_status.body.tunedModel.model}
+          - condition: ${tuning_status.body.state == "JOB_STATE_FAILED"}
+            raise: '${"Tuning failed: " + tuning_status.body.error.message}'
+          - condition: ${iterations >= max_iterations}
+            raise: "Tuning timed out"
+    - wait_and_retry:
+        call: sys.sleep
+        args:
+          seconds: 60
+    - increment_and_continue:
+        assign:
+          - iterations: ${iterations + 1}
+        next: check_tuning

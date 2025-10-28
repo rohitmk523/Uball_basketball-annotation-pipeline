@@ -1,0 +1,707 @@
+# Cumulative Training Pipeline - UUID Directory Approach
+# This workflow:
+# 1. Creates a unique UUID directory for this execution 
+# 2. For each game: checks if JSONL exists, if not creates it
+# 3. Copies all JSONL files to the UUID directory  
+# 4. Concatenates all files into single training/validation JSONL files
+# 5. Trains once with ALL accumulated data (true cumulative training)
+
+main:
+  params: [args]
+  steps:
+    - init:
+        assign:
+          - game_ids: ${args.game_ids}  # Array of game IDs
+          - project_id: "refined-circuit-474617-s8"
+          - region: "us-central1"
+          - timestamp: ${string(int(sys.now()))}
+          - pipeline_uuid: ${timestamp}
+          - execution_dir: ${"cumulative-execution-" + pipeline_uuid}
+          - pipeline_id: ${"cumulative-pipeline-" + timestamp}
+          - games_with_jsonl: []
+          - games_needing_processing: []
+          - use_flash: true  # Use Flash by default for speed
+
+    - check_use_flash_override:
+        try:
+          assign:
+            - use_flash: ${args.use_flash}
+        except:
+          # Keep default value if not provided
+          assign:
+            - use_flash: ${use_flash}
+
+    - log_start:
+        call: sys.log
+        args:
+          data: '${"🚀 Starting cumulative training for " + string(len(game_ids)) + " games in directory: " + execution_dir}'
+          severity: INFO
+
+    # Step 1: Check which games already have JSONL files
+    - check_existing_jsonl:
+        for:
+          value: game_id
+          in: ${game_ids}
+          steps:
+            - check_game_jsonl:
+                call: check_jsonl_exists
+                args:
+                  game_id: ${game_id}
+                  project_id: ${project_id}
+                result: jsonl_status
+            
+            - process_jsonl_check:
+                switch:
+                  - condition: ${jsonl_status.exists}
+                    steps:
+                      - log_existing_jsonl:
+                          call: sys.log
+                          args:
+                            data: '${"  ✅ Found existing JSONL for game: " + game_id}'
+                            severity: INFO
+                      - add_existing_game:
+                          assign:
+                            - games_with_jsonl: ${list.concat(games_with_jsonl, [game_id])}
+                  - condition: true
+                    steps:
+                      - log_missing_jsonl:
+                          call: sys.log
+                          args:
+                            data: '${"  ❌ Missing JSONL for game: " + game_id + " - will generate"}'
+                            severity: INFO
+                      - add_missing_game:
+                          assign:
+                            - games_needing_processing: ${list.concat(games_needing_processing, [game_id])}
+
+    - log_jsonl_status:
+        call: sys.log
+        args:
+          data: '${"📊 JSONL Status - Found: " + string(len(games_with_jsonl)) + ", Need to create: " + string(len(games_needing_processing))}'
+          severity: INFO
+
+    # Step 2: Process games that need JSONL creation
+    - process_missing_games:
+        switch:
+          - condition: ${len(games_needing_processing) > 0}
+            steps:
+              - log_start_processing:
+                  call: sys.log
+                  args:
+                    data: '${"🔄 Processing " + string(len(games_needing_processing)) + " games that need JSONL creation"}'
+                    severity: INFO
+              
+              - process_each_missing_game:
+                  for:
+                    value: game_id
+                    in: ${games_needing_processing}
+                    steps:
+                      - log_processing_game:
+                          call: sys.log
+                          args:
+                            data: '${"📂 Processing game: " + game_id}'
+                            severity: INFO
+                      
+                      # Export plays from database
+                      - export_game_plays:
+                          call: http.post
+                          args:
+                            url: '${"https://" + region + "-" + project_id + ".cloudfunctions.net/export-plays-cf"}'
+                            headers:
+                              Content-Type: "application/json"
+                            body:
+                              game_id: ${game_id}
+                          result: export_result
+                      
+                      - check_export_success:
+                          switch:
+                            - condition: ${export_result.body.success}
+                              next: log_export_ok
+                            - condition: true
+                              next: skip_failed_game
+                      
+                      - log_export_ok:
+                          call: sys.log
+                          args:
+                            data: '${"    ✅ Exported " + string(export_result.body.total_plays) + " plays for " + game_id}'
+                            severity: INFO
+                      
+                      # Extract clips and create JSONL
+                      - create_extract_job:
+                          call: googleapis.run.v1.namespaces.jobs.create
+                          args:
+                            parent: '${"namespaces/" + project_id}'
+                            location: ${region}
+                            body:
+                              apiVersion: run.googleapis.com/v1
+                              kind: Job
+                              metadata:
+                                name: '${"extract-" + game_id + "-" + timestamp}'
+                              spec:
+                                template:
+                                  spec:
+                                    parallelism: 1
+                                    taskCount: 1
+                                    template:
+                                      spec:
+                                        containers:
+                                        - image: '${"gcr.io/" + project_id + "/extract-clips:latest"}'
+                                          env:
+                                          - name: GAME_ID
+                                            value: ${game_id}
+                                          - name: PLAYS_FILE_GCS
+                                            value: ${export_result.body.files.all_plays}
+                                          - name: GCS_TRAINING_BUCKET
+                                            value: "uball-training-data"
+                                          - name: GCS_VIDEO_BUCKET
+                                            value: "uball-videos-production"
+                                          - name: SKIP_IF_EXISTS
+                                            value: "false"  # Force creation for missing games
+                                          resources:
+                                            limits:
+                                              memory: 16Gi
+                                              cpu: "8"
+                                        maxRetries: 3
+                                        timeoutSeconds: "3600"
+                          result: extract_job
+                      
+                      - execute_extract_job:
+                          call: googleapis.run.v1.namespaces.jobs.run
+                          args:
+                            name: '${"namespaces/" + project_id + "/jobs/" + extract_job.metadata.name}'
+                            location: ${region}
+                          result: extract_execution
+                      
+                      - wait_extract:
+                          call: wait_for_execution_completion
+                          args:
+                            execution_name: ${extract_execution.metadata.name}
+                            project_id: ${project_id}
+                            timeout_minutes: 60
+                          result: extract_status
+                      
+                      # Find newly created training files and add them
+                      - find_new_training_files:
+                          call: find_latest_training_files
+                          args:
+                            game_id: ${game_id}
+                            project_id: ${project_id}
+                          result: new_files
+                      
+                      - log_files_added:
+                          call: sys.log
+                          args:
+                            data: '${"    📁 Created JSONL files for: " + game_id}'
+                            severity: INFO
+                      
+                      - log_game_completed:
+                          call: sys.log
+                          args:
+                            data: '${"    ✅ Completed JSONL creation for: " + game_id}'
+                            severity: INFO
+                          next: continue_processing
+                      
+                      - skip_failed_game:
+                          call: sys.log
+                          args:
+                            data: '${"    ⚠️ Skipping failed game: " + game_id}'
+                            severity: WARNING
+                      
+                      - continue_processing:
+                          next: continue
+          - condition: true
+            steps:
+              - log_no_missing:
+                  call: sys.log
+                  args:
+                    data: "✅ All games already have JSONL files, proceeding to cumulative training"
+                    severity: INFO
+
+    - log_all_games_ready:
+        call: sys.log
+        args:
+          data: '${"✅ All " + string(len(game_ids)) + " games ready with JSONL files"}'
+          severity: INFO
+
+    - log_files_summary:
+        call: sys.log
+        args:
+          data: '${"📊 Ready to collect and combine files from " + string(len(game_ids)) + " games"}'
+          severity: INFO
+
+    # Step 3: Create execution directory and copy all JSONL files
+    - create_execution_directory:
+        call: copy_all_game_files
+        args:
+          game_ids: ${game_ids}
+          execution_dir: ${execution_dir}
+          project_id: ${project_id}
+          timestamp: ${timestamp}
+        result: combined_files
+
+    - log_combined_files:
+        call: sys.log
+        args:
+          data: '${"📁 Combined files ready - Training: " + combined_files.training_file}'
+          severity: INFO
+
+    # Step 4: Determine model to use
+    - set_base_model:
+        switch:
+          - condition: ${use_flash}
+            assign:
+              - base_model: "gemini-2.5-flash"
+              - model_name_prefix: "basketball-flash"
+          - condition: true
+            assign:
+              - base_model: "gemini-2.5-pro"
+              - model_name_prefix: "basketball-pro"
+
+    - determine_hyperparameters:
+        assign:
+          - epoch_count: "5"
+          - learning_rate: "1.0"
+
+    # Step 5: Create tuning job with cumulative data
+    - create_tuning_job:
+        call: http.post
+        args:
+          url: '${"https://" + region + "-aiplatform.googleapis.com/v1/projects/" + project_id + "/locations/" + region + "/tuningJobs"}'
+          auth:
+            type: OAuth2
+          headers:
+            Content-Type: "application/json"
+          body:
+            baseModel: ${base_model}
+            supervisedTuningSpec:
+              trainingDatasetUri: ${combined_files.training_file}
+              validationDatasetUri: ${combined_files.validation_file}
+              hyperParameters:
+                epochCount: ${epoch_count}
+                learningRateMultiplier: ${learning_rate}
+                adapterSize: "ADAPTER_SIZE_ONE"
+            tunedModelDisplayName: '${"" + model_name_prefix + "-cumulative-" + string(len(game_ids)) + "games-" + timestamp}'
+            description: '${"Cumulative training on " + string(len(game_ids)) + " games using " + base_model}'
+        result: tuning_job_response
+
+    - log_tuning_started:
+        call: sys.log
+        args:
+          data: '${"🤖 Started tuning job: " + tuning_job_response.body.name}'
+          severity: INFO
+
+    # Step 6: Monitor tuning
+    - wait_tuning_completion:
+        call: monitor_tuning_job
+        args:
+          job_name: ${tuning_job_response.body.name}
+          project_id: ${project_id}
+          region: ${region}
+          timeout_minutes: 480
+        result: tuning_status
+
+    - log_tuning_complete:
+        call: sys.log
+        args:
+          data: '${"✅ Tuning completed: " + tuning_status.tuned_model}'
+          severity: INFO
+
+    # Success
+    - return_success:
+        return:
+          success: true
+          pipeline_id: ${pipeline_id}
+          games_trained: ${game_ids}
+          total_games: ${len(game_ids)}
+          tuned_model: ${tuning_status.tuned_model}
+          training_file: ${combined_files.training_file}
+          validation_file: ${combined_files.validation_file}
+          base_model: ${base_model}
+
+
+# Subworkflow to check if JSONL files exist for a game
+check_jsonl_exists:
+  params: [game_id, project_id]
+  steps:
+    - build_urls:
+        assign:
+          - training_prefix: '${"games/" + game_id + "/video_training_"}'
+          - validation_prefix: '${"games/" + game_id + "/video_validation_"}'
+          - training_url_encoded: '${"https://storage.googleapis.com/storage/v1/b/uball-training-data/o?prefix=" + text.url_encode(training_prefix)}'
+          - validation_url_encoded: '${"https://storage.googleapis.com/storage/v1/b/uball-training-data/o?prefix=" + text.url_encode(validation_prefix)}'
+    
+    - list_training_files:
+        try:
+          call: http.get
+          args:
+            url: ${training_url_encoded}
+            auth:
+              type: OAuth2
+          result: training_response
+        except:
+          as: e
+          steps:
+            - return_not_exists:
+                return:
+                  exists: false
+                  game_id: ${game_id}
+
+    - list_validation_files:
+        try:
+          call: http.get
+          args:
+            url: ${validation_url_encoded}
+            auth:
+              type: OAuth2
+          result: validation_response
+        except:
+          as: e
+          steps:
+            - return_not_exists_val:
+                return:
+                  exists: false
+                  game_id: ${game_id}
+
+    - check_files_existence:
+        switch:
+          - condition: ${"items" in training_response.body and "items" in validation_response.body and len(training_response.body.items) > 0 and len(validation_response.body.items) > 0}
+            steps:
+              - build_file_info:
+                  assign:
+                    - training_file: '${"gs://uball-training-data/" + training_response.body.items[0].name}'
+                    - validation_file: '${"gs://uball-training-data/" + validation_response.body.items[0].name}'
+              - return_exists:
+                  return:
+                    exists: true
+                    game_id: ${game_id}
+                    training_file: ${training_file}
+                    validation_file: ${validation_file}
+          - condition: true
+            return:
+              exists: false
+              game_id: ${game_id}
+
+# Subworkflow to copy all game files to execution directory and combine them
+copy_all_game_files:
+  params: [game_ids, execution_dir, project_id, timestamp]
+  steps:
+    - log_collecting:
+        call: sys.log
+        args:
+          data: '${"📂 Collecting JSONL files from " + string(len(game_ids)) + " games into directory: " + execution_dir}'
+          severity: INFO
+
+    # Create combined file paths in execution directory and prepare game IDs string
+    - create_combined_paths:
+        assign:
+          - combined_training_file: '${"gs://uball-training-data/" + execution_dir + "/combined_training.jsonl"}'
+          - combined_validation_file: '${"gs://uball-training-data/" + execution_dir + "/combined_validation.jsonl"}'
+          - game_ids_string: ""
+          - game_index: 0
+          
+    # Build game IDs string for bash (since we can't use join in Cloud Workflows)
+    - build_game_ids_string:
+        for:
+          value: game_id
+          in: ${game_ids}
+          steps:
+            - append_game_id:
+                switch:
+                  - condition: ${game_index == 0}
+                    assign:
+                      - game_ids_string: ${game_id}
+                      - game_index: ${game_index + 1}
+                  - condition: true
+                    assign:
+                      - game_ids_string: ${game_ids_string + " " + game_id}
+                      - game_index: ${game_index + 1}
+
+    # Use Cloud Run Job to copy and combine all files
+    - create_copy_combine_job:
+        call: googleapis.run.v1.namespaces.jobs.create
+        args:
+          parent: '${"namespaces/" + project_id}'
+          location: us-central1
+          body:
+            apiVersion: run.googleapis.com/v1
+            kind: Job
+            metadata:
+              name: '${"copy-combine-" + timestamp}'
+            spec:
+              template:
+                spec:
+                  parallelism: 1
+                  taskCount: 1
+                  template:
+                    spec:
+                      containers:
+                      - image: "gcr.io/google.com/cloudsdktool/cloud-sdk:latest"
+                        command: ["/bin/bash"]
+                        args:
+                          - "-c"
+                          - |
+                            echo "🚀 Starting cumulative file collection and combination..."
+                            
+                            # Create execution directory
+                            echo "📁 Creating execution directory: gs://uball-training-data/${EXECUTION_DIR}/"
+                            gsutil -m mkdir -p "gs://uball-training-data/${EXECUTION_DIR}/"
+                            
+                            # Initialize combined files
+                            echo "🔧 Initializing combined JSONL files..."
+                            echo "" > /tmp/combined_training.jsonl
+                            echo "" > /tmp/combined_validation.jsonl
+                            
+                            # Process each game
+                            GAME_COUNT=0
+                            TRAINING_EXAMPLES=0
+                            VALIDATION_EXAMPLES=0
+                            
+                            for GAME_ID in ${GAME_IDS}; do
+                              echo "📂 Processing game: $GAME_ID"
+                              GAME_COUNT=$((GAME_COUNT + 1))
+                              
+                              # Create game directory in execution folder
+                              echo "  📁 Creating game directory in execution folder..."
+                              gsutil -m mkdir -p "gs://uball-training-data/${EXECUTION_DIR}/${GAME_ID}/"
+                              
+                              # Copy all game data to execution directory
+                              echo "  🔄 Copying game data to execution directory..."
+                              gsutil -m cp -r "gs://uball-training-data/games/${GAME_ID}/*" "gs://uball-training-data/${EXECUTION_DIR}/${GAME_ID}/" 2>/dev/null || echo "No existing game data to copy"
+                              
+                              # Find and process training files
+                              echo "  🔍 Finding training files for $GAME_ID..."
+                              gsutil ls "gs://uball-training-data/games/$GAME_ID/video_training_*.jsonl" > /tmp/training_files_$GAME_ID.txt 2>/dev/null || echo "No training files found"
+                              
+                              if [ -s "/tmp/training_files_$GAME_ID.txt" ]; then
+                                TRAINING_FILE=$(head -1 /tmp/training_files_$GAME_ID.txt)
+                                echo "  📥 Processing training file: $TRAINING_FILE"
+                                gsutil cp "$TRAINING_FILE" "/tmp/game_${GAME_ID}_training.jsonl"
+                                cat "/tmp/game_${GAME_ID}_training.jsonl" >> /tmp/combined_training.jsonl
+                                LINES=$(wc -l < "/tmp/game_${GAME_ID}_training.jsonl" || echo "0")
+                                TRAINING_EXAMPLES=$((TRAINING_EXAMPLES + LINES))
+                                echo "    ✅ Added $LINES training examples"
+                              fi
+                              
+                              # Find and process validation files  
+                              echo "  🔍 Finding validation files for $GAME_ID..."
+                              gsutil ls "gs://uball-training-data/games/$GAME_ID/video_validation_*.jsonl" > /tmp/validation_files_$GAME_ID.txt 2>/dev/null || echo "No validation files found"
+                              
+                              if [ -s "/tmp/validation_files_$GAME_ID.txt" ]; then
+                                VALIDATION_FILE=$(head -1 /tmp/validation_files_$GAME_ID.txt)
+                                echo "  📥 Processing validation file: $VALIDATION_FILE"
+                                gsutil cp "$VALIDATION_FILE" "/tmp/game_${GAME_ID}_validation.jsonl"
+                                cat "/tmp/game_${GAME_ID}_validation.jsonl" >> /tmp/combined_validation.jsonl
+                                LINES=$(wc -l < "/tmp/game_${GAME_ID}_validation.jsonl" || echo "0")
+                                VALIDATION_EXAMPLES=$((VALIDATION_EXAMPLES + LINES))
+                                echo "    ✅ Added $LINES validation examples"
+                              fi
+                              
+                              echo "  ✅ Completed processing game: $GAME_ID"
+                            done
+                            
+                            # Upload combined files
+                            echo "📤 Uploading combined files..."
+                            gsutil cp /tmp/combined_training.jsonl "${COMBINED_TRAINING_FILE}"
+                            gsutil cp /tmp/combined_validation.jsonl "${COMBINED_VALIDATION_FILE}"
+                            
+                            echo "🎉 Cumulative training data ready!"
+                            echo "📊 Summary:"
+                            echo "  Games processed: $GAME_COUNT"
+                            echo "  Training examples: $TRAINING_EXAMPLES"
+                            echo "  Validation examples: $VALIDATION_EXAMPLES"
+                            echo "  Training file: ${COMBINED_TRAINING_FILE}"
+                            echo "  Validation file: ${COMBINED_VALIDATION_FILE}"
+                        env:
+                        - name: EXECUTION_DIR
+                          value: ${execution_dir}
+                        - name: GAME_IDS
+                          value: ${game_ids_string}
+                        - name: COMBINED_TRAINING_FILE
+                          value: ${combined_training_file}
+                        - name: COMBINED_VALIDATION_FILE
+                          value: ${combined_validation_file}
+                        resources:
+                          limits:
+                            memory: 4Gi
+                            cpu: "2"
+                      maxRetries: 3
+                      timeoutSeconds: "3600"
+        result: copy_job
+
+    # Execute combine job
+    - execute_copy_job:
+        call: googleapis.run.v1.namespaces.jobs.run
+        args:
+          name: '${"namespaces/" + project_id + "/jobs/" + copy_job.metadata.name}'
+          location: us-central1
+        result: copy_execution
+
+    # Wait for completion
+    - wait_copy_completion:
+        call: wait_for_execution_completion
+        args:
+          execution_name: ${copy_execution.metadata.name}
+          project_id: ${project_id}
+          timeout_minutes: 60
+        result: copy_status
+
+    # Log successful combination
+    - log_copy_success:
+        call: sys.log
+        args:
+          data: '${"✅ Successfully collected and combined all game files in directory: " + execution_dir}'
+          severity: INFO
+
+    # Return combined file information
+    - return_combined_files:
+        return:
+          training_file: ${combined_training_file}
+          validation_file: ${combined_validation_file}
+          execution_directory: ${execution_dir}
+          success: true
+
+# Subworkflows from hybrid pipeline
+wait_for_execution_completion:
+  params: [execution_name, project_id, timeout_minutes]
+  steps:
+    - init_polling:
+        assign:
+          - poll_interval_seconds: 30
+          - max_iterations: ${timeout_minutes * 2}
+          - iteration: 0
+
+    - poll_execution_status:
+        call: googleapis.run.v1.namespaces.executions.get
+        args:
+          name: '${"namespaces/" + project_id + "/executions/" + execution_name}'
+          location: us-central1
+        result: execution_status
+
+    - check_execution_completion:
+        switch:
+          - condition: ${len(execution_status.status.conditions) > 0 and execution_status.status.conditions[0].type == "Completed"}
+            next: execution_completed
+          - condition: ${len(execution_status.status.conditions) > 0 and execution_status.status.conditions[0].type == "Failed"}
+            next: execution_failed
+          - condition: ${iteration >= max_iterations}
+            next: execution_timeout
+
+    - wait_and_retry:
+        call: sys.sleep
+        args:
+          seconds: ${poll_interval_seconds}
+
+    - increment_counter:
+        assign:
+          - iteration: ${iteration + 1}
+        next: poll_execution_status
+
+    - execution_completed:
+        return: ${execution_status}
+
+    - execution_failed:
+        raise: '${"Execution failed: " + execution_status.status.conditions[0].message}'
+
+    - execution_timeout:
+        raise: '${"Execution timed out after " + string(timeout_minutes) + " minutes"}'
+
+monitor_tuning_job:
+  params: [job_name, project_id, region, timeout_minutes]
+  steps:
+    - init_polling:
+        assign:
+          - poll_interval_seconds: 60
+          - max_iterations: ${timeout_minutes}
+          - iteration: 0
+
+    - poll_tuning_status:
+        call: http.get
+        args:
+          url: '${"https://" + region + "-aiplatform.googleapis.com/v1/" + job_name}'
+          auth:
+            type: OAuth2
+        result: tuning_status
+
+    - check_tuning_completion:
+        switch:
+          - condition: ${tuning_status.body.state == "JOB_STATE_SUCCEEDED"}
+            next: tuning_completed
+          - condition: ${tuning_status.body.state == "JOB_STATE_FAILED"}
+            next: tuning_failed
+          - condition: ${iteration >= max_iterations}
+            next: tuning_timeout
+
+    - wait_and_retry:
+        call: sys.sleep
+        args:
+          seconds: ${poll_interval_seconds}
+
+    - increment_counter:
+        assign:
+          - iteration: ${iteration + 1}
+        next: poll_tuning_status
+
+    - tuning_completed:
+        return:
+          success: true
+          state: ${tuning_status.body.state}
+          tuned_model: ${tuning_status.body.tunedModel.model}
+
+    - tuning_failed:
+        raise: '${"Tuning failed: " + tuning_status.body.error.message}'
+
+    - tuning_timeout:
+        raise: '${"Tuning timed out after " + string(timeout_minutes) + " minutes"}'
+
+find_latest_training_files:
+  params: [game_id, project_id]
+  steps:
+    - build_urls:
+        assign:
+          - training_prefix: '${"games/" + game_id + "/video_training_"}'
+          - validation_prefix: '${"games/" + game_id + "/video_validation_"}'
+          - training_url_encoded: '${"https://storage.googleapis.com/storage/v1/b/uball-training-data/o?prefix=" + text.url_encode(training_prefix)}'
+          - validation_url_encoded: '${"https://storage.googleapis.com/storage/v1/b/uball-training-data/o?prefix=" + text.url_encode(validation_prefix)}'
+    
+    - list_training_files:
+        call: http.get
+        args:
+          url: ${training_url_encoded}
+          auth:
+            type: OAuth2
+        result: training_response
+
+    - list_validation_files:
+        call: http.get
+        args:
+          url: ${validation_url_encoded}
+          auth:
+            type: OAuth2
+        result: validation_response
+
+    - extract_training_files:
+        switch:
+          - condition: ${"items" in training_response.body}
+            assign:
+              - training_files: ${training_response.body.items}
+          - condition: true
+            assign:
+              - training_files: []
+    
+    - extract_validation_files:
+        switch:
+          - condition: ${"items" in validation_response.body}
+            assign:
+              - validation_files: ${validation_response.body.items}
+          - condition: true
+            assign:
+              - validation_files: []
+
+    - check_files_exist:
+        switch:
+          - condition: ${len(training_files) > 0 and len(validation_files) > 0}
+            return:
+              training_file: '${"gs://uball-training-data/" + training_files[0].name}'
+              validation_file: '${"gs://uball-training-data/" + validation_files[0].name}'
+          - condition: true
+            raise: '${"No training files found for game: " + game_id}'
+

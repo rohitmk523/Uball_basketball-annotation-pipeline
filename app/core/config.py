@@ -30,10 +30,11 @@ class Settings(BaseSettings):
     GCS_TRAINING_BUCKET: str = "uball-training-data"
     GCS_MODEL_BUCKET: str = "uball-models"
     
-    # Vertex AI
-    VERTEX_AI_BASE_MODEL: str = "gemini-1.5-pro-002"
+    # Vertex AI - Basketball Optimized Models
+    VERTEX_AI_BASE_MODEL: str = "gemini-2.5-pro"  # Proven for basketball analysis
     VERTEX_AI_FINETUNED_ENDPOINT: str = ""
     VERTEX_AI_TRAINING_PIPELINE: str = ""
+    VERTEX_AI_MODEL_REGISTRY_ENABLED: bool = True
     
     # Supabase
     SUPABASE_URL: str
