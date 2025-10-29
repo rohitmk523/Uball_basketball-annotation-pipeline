@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from google.cloud import storage
 from tqdm import tqdm
 import logging
+from supabase import create_client, Client
 
 logger = logging.getLogger(__name__)
 
@@ -22,19 +23,17 @@ logger = logging.getLogger(__name__)
 class ClipExtractorJob:
     """Extract video clips for training in Cloud Run Job environment."""
     
-    def __init__(self, game_id: str, plays_file_gcs: str, training_bucket: str, max_workers: int = 4, skip_if_exists: bool = True):
+    def __init__(self, game_id: str, training_bucket: str, max_workers: int = 4, skip_if_exists: bool = True):
         """
         Initialize clip extractor for Cloud Run Job.
         
         Args:
             game_id: Game UUID
-            plays_file_gcs: GCS URI to plays JSON file
             training_bucket: GCS bucket name for training data
             max_workers: Maximum number of parallel workers
             skip_if_exists: Skip extraction if clips already exist
         """
         self.game_id = game_id
-        self.plays_file_gcs = plays_file_gcs
         self.training_bucket_name = training_bucket
         self.max_workers = max_workers
         self.skip_if_exists = skip_if_exists
@@ -42,6 +41,14 @@ class ClipExtractorJob:
         # Initialize GCS client
         self.storage_client = storage.Client()
         self.training_bucket = self.storage_client.bucket(training_bucket)
+        
+        # Initialize Supabase client
+        supabase_url = os.environ.get("SUPABASE_URL")
+        supabase_key = os.environ.get("SUPABASE_SERVICE_KEY")
+        if not supabase_url or not supabase_key:
+            raise ValueError("SUPABASE_URL and SUPABASE_SERVICE_KEY environment variables are required")
+        
+        self.supabase: Client = create_client(supabase_url, supabase_key)
         
         # Game-based directory structure
         self.game_dir = f"games/{game_id}"
@@ -51,47 +58,58 @@ class ClipExtractorJob:
         self.temp_dir = Path("/tmp/clips_job")
         self.temp_dir.mkdir(parents=True, exist_ok=True)
         
-        # Download and load plays data
-        self.plays = self._download_and_load_plays()
+        # Load plays data from Supabase
+        self.plays = self._load_plays_from_supabase()
         
         logger.info(f"✓ Initialized ClipExtractorJob for game {game_id}")
-        logger.info(f"✓ Loaded {len(self.plays)} plays from {plays_file_gcs}")
+        logger.info(f"✓ Loaded {len(self.plays)} plays from Supabase")
         logger.info(f"✓ Using {max_workers} parallel workers")
         logger.info(f"✓ Clips will be saved to: gs://{training_bucket}/{self.clips_dir}/")
         
         # Validate that required videos exist
         self._validate_required_videos()
     
-    def _download_and_load_plays(self) -> List[Dict[str, Any]]:
-        """Download plays file from GCS and load JSON data."""
+    def _load_plays_from_supabase(self) -> List[Dict[str, Any]]:
+        """Load plays data from Supabase for the given game_id."""
         try:
-            # Parse GCS URI
-            if not self.plays_file_gcs.startswith("gs://"):
-                raise ValueError(f"Invalid GCS URI: {self.plays_file_gcs}")
+            logger.info(f"📡 Querying Supabase for plays with game_id: {self.game_id}")
             
-            # Extract bucket and blob path
-            path_parts = self.plays_file_gcs[5:].split("/", 1)  # Remove "gs://"
-            bucket_name = path_parts[0]
-            blob_path = path_parts[1]
+            # Query plays table for this game_id
+            response = self.supabase.table("plays").select("*").eq("game_id", self.game_id).execute()
             
-            # Download from GCS
-            bucket = self.storage_client.bucket(bucket_name)
-            blob = bucket.blob(blob_path)
+            if not response.data:
+                logger.warning(f"⚠️ No plays found for game_id: {self.game_id}")
+                return []
             
-            plays_local_path = self.temp_dir / "plays.json"
-            blob.download_to_filename(plays_local_path)
+            plays_data = response.data
+            logger.info(f"✓ Retrieved {len(plays_data)} plays from Supabase")
             
-            logger.info(f"✓ Downloaded plays file to {plays_local_path}")
-            
-            # Load JSON data
-            with open(plays_local_path, 'r') as f:
-                plays_data = json.load(f)
+            # Save plays data to GCS for reference (optional)
+            self._save_plays_to_gcs(plays_data)
             
             return plays_data
             
         except Exception as e:
-            logger.error(f"✗ Failed to download plays file: {e}")
+            logger.error(f"✗ Failed to load plays from Supabase: {e}")
             raise
+    
+    def _save_plays_to_gcs(self, plays_data: List[Dict[str, Any]]) -> None:
+        """Save plays data to GCS for reference."""
+        try:
+            plays_json_path = f"{self.game_dir}/plays.json"
+            blob = self.training_bucket.blob(plays_json_path)
+            
+            # Upload plays data as JSON
+            blob.upload_from_string(
+                json.dumps(plays_data, indent=2),
+                content_type="application/json"
+            )
+            
+            logger.info(f"✓ Saved plays data to gs://{self.training_bucket_name}/{plays_json_path}")
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Failed to save plays to GCS: {e}")
+            # Don't raise - this is just for reference
     
     def _get_video_gcs_path(self, game_id: str, angle: str) -> str:
         """Get GCS path for game video based on angle using Games/{game_id}/ structure."""
@@ -353,6 +371,45 @@ class ClipExtractorJob:
             result["failed_angles"] = ["ALL"]
             return result
     
+    def _process_single_play_for_angle(self, play: Dict[str, Any], video_angle: str, video_path: Path) -> Dict[str, Any]:
+        """Process a single play for a specific video angle."""
+        play_id = play["id"]
+        game_id = play["game_id"]
+        start_timestamp = play["start_timestamp"]
+        end_timestamp = play["end_timestamp"]
+        
+        result = {
+            "play_id": play_id,
+            "game_id": game_id,
+            "success_count": 0,
+            "fail_count": 0,
+            "clips_created": []
+        }
+        
+        try:
+            # Create unique clip filename
+            clip_filename = f"{play_id}_{video_angle}_{os.getpid()}_{threading.get_ident()}.mp4"
+            local_clip_path = self.temp_dir / clip_filename
+            
+            # Extract clip using the already downloaded video
+            self._extract_clip(video_path, start_timestamp, end_timestamp, local_clip_path)
+            
+            # Upload to GCS using game-based structure
+            gcs_clip_path = f"{self.clips_dir}/{play_id}_{video_angle}.mp4"
+            self._upload_clip_to_gcs(local_clip_path, gcs_clip_path)
+            
+            # Clean up local clip immediately
+            local_clip_path.unlink()
+            
+            result["success_count"] = 1
+            result["clips_created"].append(f"{video_angle}.mp4")
+            
+        except Exception as e:
+            logger.error(f"✗ Failed to extract {video_angle} clip for play {play_id}: {e}")
+            result["fail_count"] = 1
+        
+        return result
+    
     def _check_existing_clips(self) -> Dict[str, Any]:
         """Check if clips already exist for this game."""
         logger.info(f"🔍 Checking for existing clips for game: {self.game_id}")
@@ -612,28 +669,79 @@ Return a JSON array with the single play. Be precise with timestamps and identif
         success_count = 0
         fail_count = 0
         
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            # Submit all play processing tasks
-            future_to_play = {
-                executor.submit(self._process_single_play, play): play
-                for play in self.plays
-            }
+        # Process videos one at a time to save disk space
+        logger.info("🎬 Processing videos sequentially to conserve disk space...")
+        video_angles = ["FAR_LEFT", "FAR_RIGHT", "NEAR_LEFT", "NEAR_RIGHT"]
+        
+        total_angles = len(video_angles)
+        for angle_idx, video_angle in enumerate(video_angles, 1):
+            logger.info(f"📹 Processing video angle {angle_idx}/{total_angles}: {video_angle}")
             
-            # Process results with progress bar
-            for future in tqdm(as_completed(future_to_play), total=len(self.plays), desc="Extracting clips"):
-                play = future_to_play[future]
-                try:
-                    result = future.result()
-                    success_count += result["success_count"]
-                    fail_count += len(result["failed_angles"])
-                    
-                    if result["success_count"] > 0:
-                        logger.debug(f"✓ Play {result['play_id']}: {result['clips_created']}")
+            # Find all plays that need this video angle
+            plays_for_angle = []
+            for play in self.plays:
+                training_angles = self._get_training_angles(play["angle"])
+                if video_angle in training_angles:
+                    plays_for_angle.append(play)
+            
+            if not plays_for_angle:
+                logger.info(f"⏭️ No plays need {video_angle}, skipping to next angle")
+                continue
+                
+            logger.info(f"🎯 Found {len(plays_for_angle)} plays needing {video_angle}")
+            logger.info(f"📊 PROGRESS: Angle {angle_idx}/{total_angles} | Game: {self.game_id}")
+            
+            # Download this specific video
+            try:
+                logger.info(f"⬇️ Downloading {video_angle} video...")
+                video_path = self._download_video_if_needed(self.game_id, video_angle)
+                logger.info(f"✅ Downloaded {video_angle} video: {video_path}")
+                
+                # Process all plays for this video angle with detailed progress
+                plays_processed = 0
+                plays_succeeded = 0
+                plays_failed = 0
+                
+                for play_idx, play in enumerate(plays_for_angle, 1):
+                    try:
+                        logger.info(f"🎬 Processing play {play_idx}/{len(plays_for_angle)} for {video_angle} | Play ID: {play.get('id', 'unknown')}")
                         
-                except Exception as e:
-                    logger.error(f"✗ Play processing failed: {e}")
-                    training_angles = self._get_training_angles(play["angle"])
-                    fail_count += len(training_angles)
+                        result = self._process_single_play_for_angle(play, video_angle, video_path)
+                        success_count += result["success_count"]
+                        fail_count += result["fail_count"]
+                        plays_processed += 1
+                        
+                        if result["success_count"] > 0:
+                            plays_succeeded += 1
+                            logger.info(f"✅ SUCCESS: Play {play.get('id', 'unknown')} | {video_angle} clip created")
+                        else:
+                            plays_failed += 1
+                            logger.warning(f"❌ FAILED: Play {play.get('id', 'unknown')} | {video_angle} clip failed")
+                        
+                        # Log progress every 10 plays or at the end
+                        if play_idx % 10 == 0 or play_idx == len(plays_for_angle):
+                            logger.info(f"📈 PROGRESS UPDATE: {video_angle} | {play_idx}/{len(plays_for_angle)} plays processed | ✅{plays_succeeded} ❌{plays_failed}")
+                            
+                    except Exception as e:
+                        logger.error(f"✗ Play processing failed for {play.get('id', 'unknown')}: {e}")
+                        fail_count += 1
+                        plays_failed += 1
+                
+                logger.info(f"🎯 COMPLETED {video_angle}: ✅{plays_succeeded} ❌{plays_failed} total clips")
+                
+                # Clean up video file to free disk space
+                if video_path.exists():
+                    video_path.unlink()
+                    logger.info(f"🗑️ Cleaned up {video_angle} video file | Disk space freed")
+                    
+            except Exception as e:
+                logger.error(f"✗ Failed to process {video_angle}: {e}")
+                # Count failures for all plays that needed this angle
+                fail_count += len(plays_for_angle)
+            
+            # Overall progress
+            remaining_angles = total_angles - angle_idx
+            logger.info(f"📊 OVERALL PROGRESS: {angle_idx}/{total_angles} video angles complete | {remaining_angles} angles remaining")
         
         # Calculate total clips needed
         total_clips_needed = 0

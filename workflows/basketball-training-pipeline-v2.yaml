@@ -1,4 +1,6 @@
-# Simplified Cumulative Training Pipeline - Clean Version
+# Basketball Training Pipeline V2 - Cloud Functions Architecture
+# This workflow uses Cloud Functions instead of Cloud Run Jobs for better scalability
+
 main:
   params: [args]
   steps:
@@ -11,6 +13,7 @@ main:
           - execution_dir: ${"cumulative-execution-" + timestamp}
           - base_model: "gemini-2.5-pro"
           - model_prefix: "basketball-pro"
+          - function_url: "https://us-central1-refined-circuit-474617-s8.cloudfunctions.net/extract-clips-game"
 
     - log_start:
         call: sys.log
@@ -18,24 +21,76 @@ main:
           data: '${"🚀 Starting cumulative training for " + string(len(game_ids)) + " games"}'
           severity: INFO
 
-    # Step 1: Create JSONL files for each game that doesn't have them
-    - create_missing_jsonl_files:
-        for:
-          value: game_id
-          in: ${game_ids}
-          steps:
-            - check_and_create_jsonl:
-                call: check_and_create_training_data
-                args:
-                  game_id: ${game_id}
-                  project_id: ${project_id}
-                  region: ${region}
+    # Step 1: Extract clips for all games in PARALLEL using Cloud Functions
+    - extract_all_games:
+        parallel:
+          for:
+            value: game_id
+            in: ${game_ids}
+            steps:
+              - log_game_start:
+                  call: sys.log
+                  args:
+                    data: '${"🎬 Processing game: " + game_id}'
+                    severity: INFO
 
-    # Step 2: Combine all JSONL files (after ensuring they exist)
+              - call_extract_function:
+                  try:
+                    call: http.post
+                    args:
+                      url: ${function_url}
+                      auth:
+                        type: OAuth2
+                      headers:
+                        Content-Type: "application/json"
+                      body:
+                        game_id: ${game_id}
+                      timeout: 3600
+                    result: function_response
+                  except:
+                    as: e
+                    steps:
+                      - log_error:
+                          call: sys.log
+                          args:
+                            data: '${"❌ Failed to process game " + game_id + ": " + e.message}'
+                            severity: ERROR
+                      - assign_error:
+                          assign:
+                            - function_response:
+                                body:
+                                  success: false
+                                  error: ${e.message}
+                                  game_id: ${game_id}
+
+              - log_game_complete:
+                  switch:
+                    - condition: '${"clips_extracted" in function_response.body}'
+                      steps:
+                        - log_success_details:
+                            call: sys.log
+                            args:
+                              data: '${"✅ Completed game: " + game_id + " | Clips: " + string(function_response.body.clips_extracted) + "/" + string(function_response.body.clips_needed)}'
+                              severity: INFO
+                    - condition: true
+                      steps:
+                        - log_basic_complete:
+                            call: sys.log
+                            args:
+                              data: '${"✅ Game processing complete: " + game_id}'
+                              severity: INFO
+
+    - log_extraction_complete:
+        call: sys.log
+        args:
+          data: "🎉 All games processed! Starting JSONL combination..."
+          severity: INFO
+
+    # Step 2: Combine JSONL files from all games
     - set_game_variables:
         assign:
           - game_ids_str: ""
-    
+
     - build_game_ids_string:
         for:
           value: game_id
@@ -69,32 +124,31 @@ main:
                           - "-c"
                           - |
                             echo "🚀 Combining JSONL files from all games..."
-                            
+
                             # Create execution directory
                             gsutil -m mkdir -p "gs://uball-training-data/${EXECUTION_DIR}/"
-                            
+
                             # Initialize combined files (empty, not blank line)
                             touch /tmp/combined_training.jsonl
                             touch /tmp/combined_validation.jsonl
-                            
+
                             # Process all games from comma-separated list
                             game_count=0
                             IFS=',' read -ra GAMES <<< "$GAME_IDS"
                             for game_id in "${GAMES[@]}"; do
                               game_count=$((game_count + 1))
                               echo "📂 Processing game $game_count: $game_id"
-                              
+
                               # Create game directory in execution folder
                               gsutil -m mkdir -p "gs://uball-training-data/${EXECUTION_DIR}/${game_id}/"
-                              
+
                               # Find and combine training files (get the most recent)
                               training_file=$(gsutil ls "gs://uball-training-data/games/$game_id/video_training_*.jsonl" 2>/dev/null | sort | tail -1 || echo "")
                               if [ -n "$training_file" ]; then
                                 echo "📥 Downloading training file: $training_file"
                                 gsutil cp "$training_file" "/tmp/game${game_count}_training.jsonl" 2>/dev/null || true
                                 if [ -f "/tmp/game${game_count}_training.jsonl" ]; then
-                                  # Remove 4-point shot references and clean up
-                                  sed 's/4PT_MAKE/3PT_MAKE/g; s/4PT_MISS/3PT_MISS/g; s/⚠️ CRITICAL: This is UBALL basketball with a 4-POINT LINE\. 4-point shots are VALID and DIFFERENT from 3-point shots\.//g' "/tmp/game${game_count}_training.jsonl" >> /tmp/combined_training.jsonl
+                                  cat "/tmp/game${game_count}_training.jsonl" >> /tmp/combined_training.jsonl
                                   echo "✅ Added training data for game $game_id"
                                 else
                                   echo "❌ Failed to download training file for game $game_id"
@@ -102,15 +156,14 @@ main:
                               else
                                 echo "⚠️ No training file found for game $game_id"
                               fi
-                              
+
                               # Find and combine validation files (get the most recent)
                               validation_file=$(gsutil ls "gs://uball-training-data/games/$game_id/video_validation_*.jsonl" 2>/dev/null | sort | tail -1 || echo "")
                               if [ -n "$validation_file" ]; then
                                 echo "📥 Downloading validation file: $validation_file"
                                 gsutil cp "$validation_file" "/tmp/game${game_count}_validation.jsonl" 2>/dev/null || true
                                 if [ -f "/tmp/game${game_count}_validation.jsonl" ]; then
-                                  # Remove 4-point shot references and clean up
-                                  sed 's/4PT_MAKE/3PT_MAKE/g; s/4PT_MISS/3PT_MISS/g; s/⚠️ CRITICAL: This is UBALL basketball with a 4-POINT LINE\. 4-point shots are VALID and DIFFERENT from 3-point shots\.//g' "/tmp/game${game_count}_validation.jsonl" >> /tmp/combined_validation.jsonl
+                                  cat "/tmp/game${game_count}_validation.jsonl" >> /tmp/combined_validation.jsonl
                                   echo "✅ Added validation data for game $game_id"
                                 else
                                   echo "❌ Failed to download validation file for game $game_id"
@@ -119,26 +172,26 @@ main:
                                 echo "⚠️ No validation file found for game $game_id"
                               fi
                             done
-                            
+
                             # Check if files have content
                             training_lines=$(wc -l < /tmp/combined_training.jsonl)
                             validation_lines=$(wc -l < /tmp/combined_validation.jsonl)
-                            
+
                             echo "📊 Summary:"
                             echo "  - Processed games: $game_count"
                             echo "  - Training examples: $training_lines"
                             echo "  - Validation examples: $validation_lines"
-                            
+
                             if [ "$training_lines" -eq 0 ]; then
                               echo "❌ No training data found! Cannot proceed."
                               exit 1
                             fi
-                            
+
                             # Upload combined files
                             echo "📤 Uploading combined files..."
                             gsutil cp /tmp/combined_training.jsonl "gs://uball-training-data/${EXECUTION_DIR}/combined_training.jsonl"
                             gsutil cp /tmp/combined_validation.jsonl "gs://uball-training-data/${EXECUTION_DIR}/combined_validation.jsonl"
-                            
+
                             echo "✅ Combined files ready with $game_count games!"
                         env:
                         - name: EXECUTION_DIR
@@ -166,12 +219,12 @@ main:
           execution_name: ${combine_execution.metadata.name}
           project_id: ${project_id}
 
-    # Start Vertex AI tuning
+    # Step 3: Start Vertex AI tuning
     - set_file_paths:
         assign:
           - training_file: '${"gs://uball-training-data/" + execution_dir + "/combined_training.jsonl"}'
           - validation_file: '${"gs://uball-training-data/" + execution_dir + "/combined_validation.jsonl"}'
-    
+
     - create_tuning_job:
         call: http.post
         args:
@@ -284,121 +337,3 @@ monitor_tuning:
         assign:
           - iterations: ${iterations + 1}
         next: check_tuning
-
-# Check if training data exists for a game, create if missing
-check_and_create_training_data:
-  params: [game_id, project_id, region]
-  steps:
-    - log_checking_game:
-        call: sys.log
-        args:
-          data: '${"🔍 Checking training data for game: " + game_id}'
-          severity: INFO
-    
-    - check_training_files:
-        call: http.get
-        args:
-          url: '${"https://storage.googleapis.com/storage/v1/b/uball-training-data/o?prefix=games%2F" + game_id + "%2Fvideo_training_"}'
-          auth:
-            type: OAuth2
-        result: training_check
-    
-    - check_validation_files:
-        call: http.get
-        args:
-          url: '${"https://storage.googleapis.com/storage/v1/b/uball-training-data/o?prefix=games%2F" + game_id + "%2Fvideo_validation_"}'
-          auth:
-            type: OAuth2
-        result: validation_check
-    
-    - evaluate_existing:
-        switch:
-          - condition: ${"items" in training_check.body and len(training_check.body.items) > 0 and "items" in validation_check.body and len(validation_check.body.items) > 0}
-            steps:
-              - log_found_existing:
-                  call: sys.log
-                  args:
-                    data: '${"✅ Found complete training data for game: " + game_id + " (training + validation files)"}'
-                    severity: INFO
-              - return_existing:
-                  return: 
-                    game_id: ${game_id}
-                    status: "existing"
-          - condition: true
-            steps:
-              - log_creating_new:
-                  call: sys.log
-                  args:
-                    data: '${"📝 Creating training data for game: " + game_id}'
-                    severity: INFO
-              - create_training_data:
-                  call: create_extract_clips_job
-                  args:
-                    game_id: ${game_id}
-                    project_id: ${project_id}
-                    region: ${region}
-              - return_created:
-                  return:
-                    game_id: ${game_id}
-                    status: "created"
-
-# Create extract-clips job for a specific game
-create_extract_clips_job:
-  params: [game_id, project_id, region]
-  steps:
-    - create_job:
-        call: googleapis.run.v1.namespaces.jobs.create
-        args:
-          parent: '${"namespaces/" + project_id}'
-          location: ${region}
-          body:
-            apiVersion: run.googleapis.com/v1
-            kind: Job
-            metadata:
-              name: '${"extract-clips-" + game_id + "-" + string(int(sys.now()))}'
-            spec:
-              template:
-                spec:
-                  parallelism: 1
-                  taskCount: 1
-                  template:
-                    spec:
-                      containers:
-                      - image: "gcr.io/refined-circuit-474617-s8/extract-clips-job:latest"
-                        env:
-                        - name: GAME_ID
-                          value: ${game_id}
-                        - name: GCS_TRAINING_BUCKET
-                          value: "uball-training-data"
-                        - name: PROJECT_ID
-                          value: ${project_id}
-                        - name: SUPABASE_URL
-                          value: "https://mhbrsftxvxxtfgbajrlc.supabase.co"
-                        - name: SUPABASE_SERVICE_KEY
-                          value: "***REMOVED_SUPABASE_KEY***"
-                        resources:
-                          limits:
-                            memory: 8Gi
-                            cpu: "4"
-                      maxRetries: 2
-                      timeoutSeconds: "21600"
-        result: extract_job
-    
-    - run_extract_job:
-        call: googleapis.run.v1.namespaces.jobs.run
-        args:
-          name: '${"namespaces/" + project_id + "/jobs/" + extract_job.metadata.name}'
-          location: ${region}
-        result: extract_execution
-    
-    - wait_extract_complete:
-        call: wait_job_complete
-        args:
-          execution_name: ${extract_execution.metadata.name}
-          project_id: ${project_id}
-    
-    - log_extract_complete:
-        call: sys.log
-        args:
-          data: '${"✅ Training data created for game: " + game_id}'
-          severity: INFO
