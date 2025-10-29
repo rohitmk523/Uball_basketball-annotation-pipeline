@@ -4,9 +4,9 @@
 import os
 from supabase import create_client
 
-# Supabase credentials
-SUPABASE_URL = "https://mhbrsftxvxxtfgbajrlc.supabase.co"
-SUPABASE_SERVICE_KEY = "***REMOVED_SUPABASE_KEY***"
+# Supabase credentials from environment variables
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "https://mhbrsftxvxxtfgbajrlc.supabase.co")
+SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_KEY"]
 
 # Game IDs from GCS
 game_ids = [
