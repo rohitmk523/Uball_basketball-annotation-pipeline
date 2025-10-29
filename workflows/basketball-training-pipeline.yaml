@@ -297,6 +297,14 @@ poll_games_completion:
                           auth:
                             type: OAuth2
                         result: files_check
+                      except:
+                        as: e
+                        steps:
+                          - assign_empty_result:
+                              assign:
+                                - files_check:
+                                    body:
+                                      items: []
 
                   - evaluate_completion:
                       switch:
