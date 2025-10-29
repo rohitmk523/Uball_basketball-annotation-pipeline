@@ -73,7 +73,7 @@ main:
         call: poll_games_completion
         args:
           game_ids: ${game_ids}
-          max_wait_minutes: 120
+          max_wait_minutes: 360
 
     - log_extraction_complete:
         call: sys.log

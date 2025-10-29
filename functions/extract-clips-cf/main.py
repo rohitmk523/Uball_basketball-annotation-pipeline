@@ -220,15 +220,67 @@ class ClipExtractor:
             if temp_clip.exists():
                 temp_clip.unlink()
 
+    def _extract_clip_from_local_video(
+        self,
+        local_video_path: str,
+        start_timestamp: float,
+        end_timestamp: float,
+        output_gcs_path: str
+    ) -> bool:
+        """Extract clip from an already-downloaded local video file."""
+        duration = end_timestamp - start_timestamp
+
+        if duration <= 0:
+            logger.error(f"❌ Invalid duration: {duration}s")
+            return False
+
+        temp_clip = self.temp_dir / f"clip_{os.getpid()}_{start_timestamp}.mp4"
+
+        try:
+            # Extract clip using ffmpeg from LOCAL video
+            cmd = [
+                "ffmpeg",
+                "-ss", str(start_timestamp),
+                "-i", local_video_path,  # Already local!
+                "-t", str(duration),
+                "-c:v", "libx264",
+                "-preset", "ultrafast",
+                "-crf", "23",
+                "-c:a", "aac",
+                "-y",
+                str(temp_clip)
+            ]
+
+            subprocess.run(cmd, check=True, capture_output=True, timeout=60)
+
+            # Upload clip to GCS
+            blob = self.training_bucket.blob(output_gcs_path)
+            blob.upload_from_filename(str(temp_clip))
+
+            return True
+
+        except subprocess.TimeoutExpired:
+            logger.error(f"❌ ffmpeg timeout after 60s")
+            return False
+        except subprocess.CalledProcessError as e:
+            logger.error(f"❌ ffmpeg failed: {e.stderr.decode() if e.stderr else str(e)}")
+            return False
+        except Exception as e:
+            logger.error(f"❌ Clip extraction error: {e}")
+            return False
+        finally:
+            if temp_clip.exists():
+                temp_clip.unlink()
+
     def extract_all_clips(self, plays: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Extract clips for all plays."""
-        logger.info(f"🎬 Starting clip extraction for {len(plays)} plays")
+        """Extract clips for all plays - OPTIMIZED to download each video only ONCE."""
+        logger.info(f"🎬 Starting OPTIMIZED clip extraction for {len(plays)} plays")
 
         success_count = 0
         fail_count = 0
         total_clips_needed = 0
 
-        # First, validate all required videos exist
+        # Step 1: Find all required videos and validate they exist
         required_videos = {}
         for play in plays:
             training_angles = self._get_training_angles(play["angle"])
@@ -241,10 +293,11 @@ class ClipExtractor:
 
         logger.info(f"✅ All required videos found: {list(required_videos.keys())}")
 
-        # Process each play
-        for idx, play in enumerate(plays, 1):
+        # Step 2: Group clips by source video (KEY OPTIMIZATION!)
+        clips_by_video = {}  # {angle: [(play_id, start_ts, end_ts, output_path), ...]}
+
+        for play in plays:
             play_id = play["id"]
-            play_angle = play["angle"]
             start_ts = play["start_timestamp"]
             end_ts = play["end_timestamp"]
 
@@ -252,35 +305,62 @@ class ClipExtractor:
                 logger.warning(f"⚠️ Play {play_id} missing timestamps, skipping")
                 continue
 
-            logger.info(f"📹 Processing play {idx}/{len(plays)}: {play_id}")
-
-            training_angles = self._get_training_angles(play_angle)
+            training_angles = self._get_training_angles(play["angle"])
 
             for angle in training_angles:
-                video_gcs_path = required_videos[angle]
-                output_gcs_path = f"{self.clips_dir}/{play_id}_{angle}.mp4"
+                if angle not in clips_by_video:
+                    clips_by_video[angle] = []
 
+                output_gcs_path = f"{self.clips_dir}/{play_id}_{angle}.mp4"
+                clips_by_video[angle].append((play_id, start_ts, end_ts, output_gcs_path))
                 total_clips_needed += 1
 
-                success = self._extract_clip_streaming(
-                    video_gcs_path,
-                    start_ts,
-                    end_ts,
-                    output_gcs_path
-                )
+        logger.info(f"📊 Organized {total_clips_needed} clips across {len(clips_by_video)} videos")
 
-                if success:
-                    success_count += 1
-                    logger.info(f"  ✅ {angle} clip created")
-                else:
-                    fail_count += 1
-                    logger.error(f"  ❌ {angle} clip failed")
+        # Step 3: Process each video ONCE and extract ALL clips from it
+        for video_idx, (angle, clips) in enumerate(clips_by_video.items(), 1):
+            video_gcs_path = required_videos[angle]
+            logger.info(f"🎥 [{video_idx}/{len(clips_by_video)}] Processing {angle}: {len(clips)} clips to extract")
 
-            # Log progress every 20 plays
-            if idx % 20 == 0:
-                logger.info(f"📊 Progress: {idx}/{len(plays)} plays | ✅ {success_count} ❌ {fail_count} clips")
+            # Download video ONCE
+            temp_video = self.temp_dir / f"{angle}_{os.getpid()}.mp4"
+            try:
+                logger.info(f"⬇️  Downloading gs://{self.video_bucket_name}/{video_gcs_path}")
+                blob = self.video_bucket.blob(video_gcs_path)
+                blob.download_to_filename(str(temp_video))
+                video_size_mb = temp_video.stat().st_size / (1024 * 1024)
+                logger.info(f"✅ Downloaded {angle} ({video_size_mb:.1f} MB)")
 
-        logger.info(f"🎉 Clip extraction complete: ✅ {success_count} ❌ {fail_count} / {total_clips_needed}")
+                # Extract ALL clips from this video
+                for clip_idx, (play_id, start_ts, end_ts, output_gcs_path) in enumerate(clips, 1):
+                    success = self._extract_clip_from_local_video(
+                        str(temp_video),
+                        start_ts,
+                        end_ts,
+                        output_gcs_path
+                    )
+
+                    if success:
+                        success_count += 1
+                    else:
+                        fail_count += 1
+
+                    # Log progress every 20 clips
+                    if clip_idx % 20 == 0:
+                        logger.info(f"  📊 {clip_idx}/{len(clips)} clips from {angle} | ✅ {success_count} total")
+
+                logger.info(f"✅ Completed {angle}: {len(clips)} clips extracted")
+
+            except Exception as e:
+                logger.error(f"❌ Failed to process {angle}: {e}")
+                fail_count += len(clips)
+            finally:
+                # Delete temp video
+                if temp_video.exists():
+                    temp_video.unlink()
+                    logger.info(f"🗑️  Deleted temp video: {angle}")
+
+        logger.info(f"🎉 OPTIMIZED extraction complete: ✅ {success_count} ❌ {fail_count} / {total_clips_needed}")
 
         return {
             "total_clips_needed": total_clips_needed,

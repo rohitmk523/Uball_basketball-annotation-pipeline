@@ -24,8 +24,9 @@ gcloud functions deploy $FUNCTION_NAME \
   --timeout=3600s \
   --max-instances=40 \
   --env-vars-file=.env.yaml \
-  --service-account=basketball-training-sa@${PROJECT_ID}.iam.gserviceaccount.com \
-  --project=$PROJECT_ID
+  --run-service-account=basketball-training-sa@${PROJECT_ID}.iam.gserviceaccount.com \
+  --project=$PROJECT_ID \
+  --execution-environment=gen2
 
 echo "✅ Deployment complete!"
 echo ""
