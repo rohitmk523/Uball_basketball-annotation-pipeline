@@ -483,15 +483,13 @@ class ClipExtractorJob:
             clip_uri = f"gs://{self.training_bucket_name}/{self.clips_dir}/{play_id}_{angle}.mp4"
         
             # Basketball-specific prompt based on your classification system
-            prompt_text = f"""⚠️ CRITICAL: This is UBALL basketball with a 4-POINT LINE. 4-point shots are VALID and DIFFERENT from 3-point shots.
-
-Analyze this basketball game video from {angle} camera angle and identify the play with its events.
+            prompt_text = f"""Analyze this basketball game video from {angle} camera angle and identify the play with its events.
 
 This is a {angle} camera view that provides {'wide court view and team formation context' if 'FAR' in angle else 'close-up details of player numbers and jerseys'}.
 
 For the play, provide:
 1. timestamp_seconds: The time in the video when the play occurs (number)
-2. classification: The primary event type (FG_MAKE, FG_MISS, 3PT_MAKE, 3PT_MISS, 4PT_MAKE, 4PT_MISS, FOUL, REBOUND, ASSIST, etc.)
+2. classification: The primary event type (FG_MAKE, FG_MISS, 3PT_MAKE, 3PT_MISS, FOUL, REBOUND, ASSIST, etc.)
 3. note: A detailed description of what happened (string)
 4. player_a: The primary player involved (format: "Player #X (Color Team)")
 5. player_b: Secondary player if applicable (format: "Player #X (Color Team)")
