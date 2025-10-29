@@ -1,27 +1,23 @@
 # 🏀 Basketball AI Annotation System
 
-**Production-ready AI system for automated basketball video analysis using fine-tuned Vertex AI (Gemini 2.5 Flash) with hybrid cloud architecture.**
-
-> 🚀 **NEW: V2 Architecture Available!**
-> We've rebuilt the training pipeline with Cloud Functions for **10x faster, more reliable processing**.
-> See [ARCHITECTURE_V2_SUMMARY.md](ARCHITECTURE_V2_SUMMARY.md) and [DEPLOYMENT_GUIDE_V2.md](DEPLOYMENT_GUIDE_V2.md)
+**Production-ready AI system for automated basketball video analysis using fine-tuned Vertex AI (Gemini 2.5 Flash) with scalable cloud architecture.**
 
 ## 🎯 Quick Overview
 
 **Input:** Basketball game videos from GCS
-**Output:** Structured play annotations with 4-point line support
-**Performance:** Continuous learning with incremental training
-**Architecture:** Cloud Functions + Workflows + Vertex AI (V2) or Cloud Run Jobs (V1)
+**Output:** Structured play annotations
+**Performance:** Parallel processing, handles 30-40 games simultaneously
+**Architecture:** Cloud Functions + Workflows + Vertex AI
 
 ---
 
 ## 🏗️ System Architecture
 
-### **V2 Architecture (Recommended - 10x Faster)**
+### **Production Architecture**
 ```
 ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
 │  Workflow       │───▶│ Cloud Functions │───▶│   Vertex AI     │
-│  (Trigger)      │    │ (Parallel x40)  │    │  (ML Training)  │
+│  (Orchestrator) │    │ (Parallel x40)  │    │  (ML Training)  │
 └─────────────────┘    └─────────────────┘    └─────────────────┘
          │                       │                       │
          │              ┌─────────────────┐    ┌─────────────────┐
@@ -30,25 +26,14 @@
                         └─────────────────┘    └─────────────────┘
 ```
 
+**Key Features**:
 - ✅ **Parallel processing** of 40 games simultaneously
-- ✅ **15-25 minutes** for 40 games (vs 3-4 hours in V1)
-- ✅ **Better reliability** with isolated failures
-- ✅ **Superior logging** in Cloud Logging
+- ✅ **Fire-and-forget pattern** - no HTTP timeout issues
+- ✅ **Polling mechanism** - supports unlimited processing time
+- ✅ **Isolated failures** - one game failure doesn't stop others
+- ✅ **Auto-scaling** - functions scale based on demand
 
-See: [ARCHITECTURE_V2_SUMMARY.md](ARCHITECTURE_V2_SUMMARY.md)
-
-### **V1 Architecture (Legacy - Sequential Processing)**
-```
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   Client API    │───▶│  Cloud Workflow │───▶│   Cloud Run     │───▶│   Vertex AI     │
-│   (FastAPI)     │    │  (Orchestrator) │    │   (Jobs)        │    │  (ML Training)  │
-└─────────────────┘    └─────────────────┘    └─────────────────┘    └─────────────────┘
-         │                       │                       │                       │
-         │              ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-         │              │ Cloud Function  │    │      GCS        │    │   Persistent    │
-         └──────────────│  (DB Export)    │    │  (Video/Data)   │    │   Endpoints     │
-                        └─────────────────┘    └─────────────────┘    └─────────────────┘
-```
+See: [DEPLOYMENT_GUIDE.md](DEPLOYMENT_GUIDE.md)
 
 ### **Component Breakdown**
 
