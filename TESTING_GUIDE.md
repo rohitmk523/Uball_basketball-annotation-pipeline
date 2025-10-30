@@ -52,20 +52,38 @@ The new Vertex AI Studio interface consists of several key sections:
   - Max output tokens
   - Stop sequences
 
-### 3. System Instructions (Optional)
-- Provide context for the model
-- Set behavioral guidelines
-- Define the model's role
+### 3. System Instructions
 
-**Example for Basketball Analysis**:
+⚠️ **IMPORTANT**: Your model was trained with a **specific prompt format**. For best results, use system instructions that match your training data.
+
+**Your Model's Training Format** (Use this!):
 ```
-You are an expert basketball analyst trained to analyze game plays. 
-Provide detailed, accurate descriptions of basketball plays including:
-- Player movements and positions
-- Ball movement and passing patterns
-- Defensive and offensive strategies
-- Key moments and transitions
-Focus on technical accuracy and tactical insights.
+You are a basketball play analyzer. Your job is to analyze video clips 
+and return structured JSON data about basketball plays.
+
+For each play, identify:
+1. timestamp_seconds: When the play occurs
+2. classification: Event type (FG_MAKE, FG_MISS, 3PT_MAKE, 3PT_MISS, 
+   FREE_THROW_MAKE, FREE_THROW_MISS, REBOUND, ASSIST, STEAL, BLOCK, 
+   TURNOVER, FOUL, TIMEOUT, SUB)
+3. note: Detailed description of what happened
+4. player_a: Primary player (format: "Player #X (Color Team)")
+5. player_b: Secondary player if applicable
+6. events: Array of all events in the play
+
+Return response as a JSON array.
+```
+
+**Alternative (For Natural Language Responses)**:
+```
+You are an expert basketball analyst. Analyze plays and provide 
+detailed, natural language descriptions of:
+- Player movements and positioning
+- Offensive and defensive strategies
+- Key moments and tactical decisions
+
+Note: This may produce less consistent results than the JSON format 
+your model was trained on.
 ```
 
 ### 4. Prompt Input Area
@@ -145,71 +163,149 @@ compared to the broadcast view.
 
 ## Prompt Templates for Testing
 
-### 1. Basic Play Analysis
+⚠️ **CRITICAL**: Your model was trained to expect a **specific prompt format**. Use these exact templates for best results!
+
+### 1. Exact Training Format (Recommended) ✅
+
+**For Broadcast/Wide Angle Clips:**
 ```
-Analyze this basketball play. Describe the offensive strategy, 
-defensive positioning, and key moments.
+Analyze this basketball game video from FAR_RIGHT camera angle and identify the play with its events.
+
+This is a FAR_RIGHT camera view that provides wide court view and team formation context.
+
+For the play, provide:
+1. timestamp_seconds: The time in the video when the play occurs (number)
+2. classification: The primary event type (FG_MAKE, FG_MISS, 3PT_MAKE, 3PT_MISS, FREE_THROW_MAKE, FREE_THROW_MISS, REBOUND, ASSIST, STEAL, BLOCK, TURNOVER, FOUL, TIMEOUT, SUB)
+3. note: A detailed description of what happened (string)
+4. player_a: The primary player involved (format: "Player #X (Color Team)")
+5. player_b: Secondary player if applicable (format: "Player #X (Color Team)")
+6. events: Array of all events in the play, each with:
+   - label: Event type (same options as classification)
+   - playerA: Player identifier (format: "Player #X (Color Team)")
+   - playerB: Secondary player if applicable
+
+Return a JSON array with the single play. Be precise with timestamps and identify all basketball events.
 
 [attach video clip]
 ```
 
-### 2. Comparative Analysis
+**For Tactical/Close-up Angle Clips:**
 ```
-Compare the execution of this play to standard basketball tactics. 
-Identify what makes it effective or ineffective.
+Analyze this basketball game video from NEAR_LEFT camera angle and identify the play with its events.
+
+This is a NEAR_LEFT camera view that provides close-up details of player numbers and jerseys.
+
+For the play, provide:
+1. timestamp_seconds: The time in the video when the play occurs (number)
+2. classification: The primary event type (FG_MAKE, FG_MISS, 3PT_MAKE, 3PT_MISS, FREE_THROW_MAKE, FREE_THROW_MISS, REBOUND, ASSIST, STEAL, BLOCK, TURNOVER, FOUL, TIMEOUT, SUB)
+3. note: A detailed description of what happened (string)
+4. player_a: The primary player involved (format: "Player #X (Color Team)")
+5. player_b: Secondary player if applicable (format: "Player #X (Color Team)")
+6. events: Array of all events in the play, each with:
+   - label: Event type (same options as classification)
+   - playerA: Player identifier (format: "Player #X (Color Team)")
+   - playerB: Secondary player if applicable
+
+Return a JSON array with the single play. Be precise with timestamps and identify all basketball events.
 
 [attach video clip]
 ```
 
-### 3. Player-Focused Analysis
+### 2. Simplified Format (If You Want Natural Language)
+
+**Basic Play Analysis:**
 ```
-Focus on the point guard's decision-making in this play. 
-Analyze their reads, passes, and execution.
+Analyze this basketball play. Describe:
+- What type of play it is (shot, turnover, etc.)
+- Which players are involved
+- What happened step by step
 
 [attach video clip]
 ```
 
-### 4. Defensive Breakdown
-```
-Analyze the defensive strategy in this play. 
-Identify the defensive scheme, rotations, and effectiveness.
-
-[attach video clip]
-```
-
-### 5. Transition Analysis
-```
-This is a transition play. Analyze the pace, decision-making, 
-and how the defense responds.
-
-[attach video clip]
-```
+**Note**: The simplified format may produce less accurate results since the model was trained on structured JSON output.
 
 ---
 
 ## Interpreting Results
 
+### Expected Output Format
+
+Your model was trained to return **structured JSON**. Here's what to expect:
+
+**Example Output:**
+```json
+[{
+  "timestamp_seconds": 2848.5,
+  "classification": "FG_MAKE",
+  "note": "Gray #7 made a layup.",
+  "player_a": "Player #7 (Gray)",
+  "player_b": null,
+  "events": [{
+    "label": "FG_MAKE",
+    "playerA": "Player #7 (Gray)",
+    "playerB": null,
+    "playerAId": "0210b121-a6d9-4261-b184-abb11f84301c",
+    "playerBId": null
+  }]
+}]
+```
+
+**For Complex Plays:**
+```json
+[{
+  "timestamp_seconds": 668.8,
+  "classification": "3PT_MISS",
+  "note": "Player #1 (Black) missed a 3-pointer, and G5 rebounded.",
+  "player_a": "Player #1 (Black)",
+  "player_b": null,
+  "events": [
+    {
+      "label": "3PT_MISS",
+      "playerA": "Player #1 (Black)",
+      "playerB": null,
+      "playerAId": "989ec7b2-9452-4d3a-9dcf-b62ea45d165e",
+      "playerBId": null
+    },
+    {
+      "label": "REBOUND",
+      "playerA": null,
+      "playerB": null,
+      "playerAId": null,
+      "playerBId": null
+    }
+  ]
+}]
+```
+
 ### What to Look For
 
 **1. Accuracy**
 - Does the model correctly identify the play type?
-- Are player movements accurately described?
-- Is the tactical analysis sound?
+- Are player numbers and team colors correct?
+- Is the event classification accurate (FG_MAKE vs 3PT_MAKE)?
+- Are timestamps reasonable?
 
-**2. Detail Level**
-- Is the analysis sufficiently detailed?
-- Does it cover all requested aspects?
-- Are technical terms used correctly?
+**2. JSON Structure**
+- Is the output valid JSON?
+- Are all required fields present?
+- Is the format consistent with training data?
 
-**3. Consistency**
+**3. Event Completeness**
+- Are all events in the play captured?
+- Is the primary event correctly classified?
+- Are secondary events (rebounds, assists) included?
+
+**4. Consistency**
 - Test the same clip multiple times
-- Results should be consistent (with some variation)
-- Core analysis should remain stable
+- JSON structure should be identical
+- Classifications should not change
+- Note descriptions may vary slightly
 
-**4. Comparison to Ground Truth**
+**5. Comparison to Ground Truth**
 - Compare to your training data descriptions
-- Check if the model's style matches training examples
-- Verify tactical accuracy
+- Check if player identification matches
+- Verify event classifications
 
 ### Evaluating Model Performance
 
@@ -533,33 +629,54 @@ Once satisfied:
 
 ## Quick Reference
 
-### Essential Prompts
+### Testing Workflow ✅
 
-```python
-# Basic Analysis
-"Analyze this basketball play. Describe the offensive strategy, 
-defensive positioning, and outcome."
-
-# Detailed Breakdown
-"Provide a detailed tactical analysis of this play, including:
-1. Initial formation and player positioning
-2. Primary action and reads
-3. Defensive coverage and adjustments
-4. Secondary actions
-5. Outcome and effectiveness rating"
-
-# Comparative
-"Compare this play execution to standard basketball tactics. 
-What makes it effective or ineffective?"
-
-# Player-Focused
-"Focus on [player position]'s decision-making and execution 
-in this play."
-
-# Coaching Perspective
-"From a coaching perspective, analyze the execution of this play. 
-What was done well and what could be improved?"
+**Step 1: Set System Instructions (Optional but Recommended)**
 ```
+You are a basketball play analyzer. Your job is to analyze video clips 
+and return structured JSON data about basketball plays.
+
+For each play, identify:
+1. timestamp_seconds: When the play occurs
+2. classification: Event type (FG_MAKE, FG_MISS, 3PT_MAKE, etc.)
+3. note: Detailed description
+4. player_a: Primary player (format: "Player #X (Color Team)")
+5. player_b: Secondary player if applicable
+6. events: Array of all events
+
+Return response as a JSON array.
+```
+
+**Step 2: Write Your Prompt**
+
+For broadcast/wide angle:
+```
+Analyze this basketball game video from FAR_RIGHT camera angle and identify the play with its events.
+
+This is a FAR_RIGHT camera view that provides wide court view and team formation context.
+
+For the play, provide:
+1. timestamp_seconds: The time in the video when the play occurs (number)
+2. classification: The primary event type (FG_MAKE, FG_MISS, 3PT_MAKE, 3PT_MISS, FREE_THROW_MAKE, FREE_THROW_MISS, REBOUND, ASSIST, STEAL, BLOCK, TURNOVER, FOUL, TIMEOUT, SUB)
+3. note: A detailed description of what happened (string)
+4. player_a: The primary player involved (format: "Player #X (Color Team)")
+5. player_b: Secondary player if applicable (format: "Player #X (Color Team)")
+6. events: Array of all events in the play, each with:
+   - label: Event type
+   - playerA: Player identifier
+   - playerB: Secondary player if applicable
+
+Return a JSON array with the single play. Be precise with timestamps and identify all basketball events.
+```
+
+**Step 3: Upload Video or Reference GCS Path**
+- Click "+" to upload a clip from your computer
+- OR reference GCS: `gs://uball-training-data/games/{game_id}/clips/{play_id}_FAR_RIGHT.mp4`
+
+**Step 4: Submit and Review**
+- Click Submit
+- Expect JSON output
+- Validate the structure and accuracy
 
 ### Recommended Settings
 
