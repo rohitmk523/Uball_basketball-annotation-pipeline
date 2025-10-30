@@ -1,16 +1,14 @@
 """
-Cloud Function (2nd Gen) for extracting video clips and creating training data.
+Cloud Run Job for extracting video clips and creating training data.
 
-This function:
-1. Receives a game_id via HTTP POST
-2. Queries Supabase for all plays in that game
-3. Streams videos from GCS and extracts clips using ffmpeg
+This module provides the ClipExtractor class that:
+1. Queries Supabase for all plays in a given game
+2. Downloads videos from GCS
+3. Extracts clips using ffmpeg
 4. Uploads clips to training bucket
 5. Creates JSONL training files
 
-Trigger: HTTP
-Memory: 8GB (configurable)
-Timeout: 60 minutes
+Used by: Cloud Run Jobs
 """
 
 import os
@@ -20,7 +18,6 @@ import tempfile
 import subprocess
 from pathlib import Path
 from typing import Dict, Any, List, Optional
-import functions_framework
 from google.cloud import storage
 from supabase import create_client, Client
 import random
@@ -90,6 +87,60 @@ class ClipExtractor:
         except Exception as e:
             logger.error(f"❌ Failed to load plays from Supabase: {e}")
             raise
+
+    def check_existing_clips(self, plays: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """
+        Check if clips already exist in GCS for this game.
+        
+        Returns:
+            {
+                "all_exist": bool,
+                "expected_count": int,
+                "existing_count": int,
+                "missing_clips": List[str]
+            }
+        """
+        logger.info(f"🔍 Checking for existing clips in gs://{self.training_bucket_name}/{self.clips_dir}/")
+        
+        # Calculate expected clips (2 angles per play)
+        expected_clips = []
+        for play in plays:
+            play_id = play["id"]
+            training_angles = self._get_training_angles(play["angle"])
+            for angle in training_angles:
+                clip_path = f"{self.clips_dir}/{play_id}_{angle}.mp4"
+                expected_clips.append(clip_path)
+        
+        expected_count = len(expected_clips)
+        logger.info(f"📊 Expected {expected_count} clips for {len(plays)} plays")
+        
+        # Check which clips exist
+        existing_count = 0
+        missing_clips = []
+        
+        for clip_path in expected_clips:
+            blob = self.training_bucket.blob(clip_path)
+            if blob.exists():
+                existing_count += 1
+            else:
+                missing_clips.append(clip_path)
+        
+        all_exist = (existing_count == expected_count)
+        
+        if all_exist:
+            logger.info(f"✅ All {expected_count} clips already exist! Skipping extraction.")
+        else:
+            logger.info(f"⚠️ Found {existing_count}/{expected_count} clips. Missing {len(missing_clips)} clips.")
+            if len(missing_clips) <= 5:
+                for clip in missing_clips:
+                    logger.info(f"  - Missing: {clip}")
+        
+        return {
+            "all_exist": all_exist,
+            "expected_count": expected_count,
+            "existing_count": existing_count,
+            "missing_clips": missing_clips
+        }
 
     def _save_plays_to_gcs(self, plays: List[Dict[str, Any]]) -> None:
         """Save plays data to GCS for reference."""
@@ -524,88 +575,3 @@ Return a JSON array with the single play. Be precise with timestamps and identif
             logger.info(f"🗑️ Cleaned up temp dir: {self.temp_dir}")
         except Exception as e:
             logger.warning(f"⚠️ Failed to cleanup temp dir: {e}")
-
-
-@functions_framework.http
-def extract_clips_game(request):
-    """
-    Cloud Function entry point.
-
-    Expected request body:
-    {
-        "game_id": "uuid-string"
-    }
-
-    Returns:
-    {
-        "success": true,
-        "game_id": "uuid",
-        "clips_extracted": 150,
-        "clips_failed": 5,
-        "training_file": "gs://...",
-        "validation_file": "gs://..."
-    }
-    """
-    try:
-        # Parse request
-        request_json = request.get_json(silent=True)
-        if not request_json or 'game_id' not in request_json:
-            return {
-                "success": False,
-                "error": "Missing 'game_id' in request body"
-            }, 400
-
-        game_id = request_json['game_id']
-
-        logger.info(f"🚀 Starting clip extraction for game: {game_id}")
-
-        # Initialize extractor
-        extractor = ClipExtractor(game_id)
-
-        # Load plays from Supabase
-        plays = extractor.load_plays()
-
-        if not plays:
-            return {
-                "success": False,
-                "error": f"No plays found for game_id: {game_id}"
-            }, 404
-
-        # Extract clips
-        clip_results = extractor.extract_all_clips(plays)
-
-        # Create JSONL files
-        jsonl_results = extractor.create_jsonl_files(plays)
-
-        # Cleanup
-        extractor.cleanup()
-
-        # Build response
-        response = {
-            "success": True,
-            "game_id": game_id,
-            "total_plays": len(plays),
-            "clips_extracted": clip_results["success_count"],
-            "clips_failed": clip_results["fail_count"],
-            "clips_needed": clip_results["total_clips_needed"],
-            "success_rate": clip_results["success_rate"]
-        }
-
-        if jsonl_results.get("success"):
-            response["training_file"] = jsonl_results["training_file"]
-            response["validation_file"] = jsonl_results["validation_file"]
-            response["training_examples"] = jsonl_results["training_examples"]
-            response["validation_examples"] = jsonl_results["validation_examples"]
-        else:
-            response["jsonl_error"] = jsonl_results.get("error")
-
-        logger.info(f"✅ Completed extraction for game {game_id}")
-
-        return response, 200
-
-    except Exception as e:
-        logger.error(f"❌ Function failed: {e}", exc_info=True)
-        return {
-            "success": False,
-            "error": str(e)
-        }, 500

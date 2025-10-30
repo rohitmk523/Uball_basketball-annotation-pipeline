@@ -1,7 +1,0 @@
-# Extract Clips Job Dependencies
-google-cloud-storage==2.*
-supabase==2.*
-python-dotenv==1.*
-tqdm==4.*
-requests==2.*
-aiofiles==24.*

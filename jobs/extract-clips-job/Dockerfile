@@ -1,32 +1,23 @@
-# Extract Clips Cloud Run Job
 FROM python:3.11-slim
 
-# Install system dependencies
+# Install ffmpeg and system dependencies
 RUN apt-get update && apt-get install -y \
     ffmpeg \
-    wget \
-    curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
 WORKDIR /app
 
-# Copy requirements first for better caching
+# Copy requirements and install Python dependencies
 COPY requirements.txt .
-
-# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
-COPY main.py .
 COPY extract_clips_job.py .
+COPY main.py .
 
-# Create directories for processing
-RUN mkdir -p /tmp/cache /tmp/clips
-
-# Set environment variables
+# Set Python to run unbuffered (see logs immediately)
 ENV PYTHONUNBUFFERED=1
-ENV TMPDIR=/tmp
 
 # Run the job
 CMD ["python", "main.py"]

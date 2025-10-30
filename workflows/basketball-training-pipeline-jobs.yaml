@@ -1,5 +1,5 @@
-# Basketball Training Pipeline V3 - Fire-and-Forget + Polling Pattern
-# Solves the timeout issue by triggering functions asynchronously and polling for completion
+# Basketball Training Pipeline V4 - Cloud Run Jobs (Parallel Execution)
+# Uses Cloud Run Jobs instead of Cloud Functions for true parallel processing
 
 main:
   params: [args]
@@ -13,15 +13,15 @@ main:
           - execution_dir: ${"cumulative-execution-" + timestamp}
           - base_model: "gemini-2.5-pro"
           - model_prefix: "basketball-pro"
-          - function_url: "https://us-central1-refined-circuit-474617-s8.cloudfunctions.net/extract-clips-game"
+          - job_name: "extract-clips-job"
 
     - log_start:
         call: sys.log
         args:
-          data: '${"🚀 Starting cumulative training for " + string(len(game_ids)) + " games"}'
+          data: '${"🚀 Starting cumulative training for " + string(len(game_ids)) + " games using Cloud Run Jobs"}'
           severity: INFO
 
-    # Step 1: Trigger all Cloud Functions asynchronously (fire-and-forget)
+    # Step 1: Trigger Cloud Run Jobs for all games in parallel
     - trigger_all_games:
         parallel:
           for:
@@ -31,41 +31,45 @@ main:
               - log_trigger_start:
                   call: sys.log
                   args:
-                    data: '${"🚀 Triggering extraction for game: " + game_id}'
+                    data: '${"🚀 Triggering Cloud Run Job for game: " + game_id}'
                     severity: INFO
 
-              - trigger_function:
+              - trigger_job:
                   try:
                     call: http.post
                     args:
-                      url: ${function_url}
+                      url: '${"https://run.googleapis.com/v2/projects/" + project_id + "/locations/" + region + "/jobs/" + job_name + ":run"}'
                       auth:
                         type: OAuth2
                       headers:
                         Content-Type: "application/json"
                       body:
-                        game_id: ${game_id}
-                      timeout: 10
-                    result: trigger_response
+                        overrides:
+                          containerOverrides:
+                            - env:
+                                - name: GAME_ID
+                                  value: ${game_id}
+                    result: job_execution
                   except:
                     as: e
                     steps:
-                      - log_trigger_note:
+                      - log_trigger_error:
                           call: sys.log
                           args:
-                            data: '${"⏱️ Function triggered for " + game_id + " (may timeout, will poll for completion)"}'
-                            severity: INFO
+                            data: '${"⚠️ Failed to trigger job for game " + game_id + ": " + e.message}'
+                            severity: WARNING
+                          next: continue
 
               - log_triggered:
                   call: sys.log
                   args:
-                    data: '${"✅ Function triggered for game: " + game_id}'
+                    data: '${"✅ Cloud Run Job triggered for game: " + game_id + " (Execution: " + job_execution.body.name + ")"}'
                     severity: INFO
 
     - log_all_triggered:
         call: sys.log
         args:
-          data: "✅ All Cloud Functions triggered! Now polling for completion..."
+          data: "✅ All Cloud Run Jobs triggered! Now polling for completion..."
           severity: INFO
 
     # Step 2: Poll for completion by checking JSONL files in GCS
@@ -81,127 +85,23 @@ main:
           data: "🎉 All games processed! Starting JSONL combination..."
           severity: INFO
 
-    # Step 3: Combine JSONL files from all games
-    - set_game_variables:
-        assign:
-          - game_ids_str: ""
-
-    - build_game_ids_string:
-        for:
-          value: game_id
-          in: ${game_ids}
-          steps:
-            - append_game_id:
-                assign:
-                  - game_ids_str: ${game_ids_str + game_id + ","}
-
-    - combine_files:
-        call: googleapis.run.v1.namespaces.jobs.create
+    # Step 3: Combine JSONL files using Cloud Function (simple and reliable)
+    - call_combine_function:
+        call: http.post
         args:
-          parent: '${"namespaces/" + project_id}'
-          location: ${region}
+          url: "https://us-central1-refined-circuit-474617-s8.cloudfunctions.net/combine-jsonl"
+          headers:
+            Content-Type: "application/json"
           body:
-            apiVersion: run.googleapis.com/v1
-            kind: Job
-            metadata:
-              name: '${"combine-" + timestamp}'
-            spec:
-              template:
-                spec:
-                  parallelism: 1
-                  taskCount: 1
-                  template:
-                    spec:
-                      containers:
-                      - image: "gcr.io/google.com/cloudsdktool/cloud-sdk:latest"
-                        command: ["/bin/bash"]
-                        args:
-                          - "-c"
-                          - |
-                            echo "🚀 Combining JSONL files from all games..."
+            game_ids: ${game_ids}
+            execution_dir: ${execution_dir}
+        result: combine_result
 
-                            # Create execution directory
-                            gsutil -m mkdir -p "gs://uball-training-data/${EXECUTION_DIR}/"
-
-                            # Initialize combined files
-                            touch /tmp/combined_training.jsonl
-                            touch /tmp/combined_validation.jsonl
-
-                            # Process all games
-                            game_count=0
-                            IFS=',' read -ra GAMES <<< "$GAME_IDS"
-                            for game_id in "${GAMES[@]}"; do
-                              game_count=$((game_count + 1))
-                              echo "📂 Processing game $game_count: $game_id"
-
-                              # Find and combine training files (get the most recent)
-                              training_file=$(gsutil ls "gs://uball-training-data/games/$game_id/video_training_*.jsonl" 2>/dev/null | sort | tail -1 || echo "")
-                              if [ -n "$training_file" ]; then
-                                echo "📥 Downloading training file: $training_file"
-                                gsutil cp "$training_file" "/tmp/game${game_count}_training.jsonl" 2>/dev/null || true
-                                if [ -f "/tmp/game${game_count}_training.jsonl" ]; then
-                                  cat "/tmp/game${game_count}_training.jsonl" >> /tmp/combined_training.jsonl
-                                  echo "✅ Added training data for game $game_id"
-                                fi
-                              fi
-
-                              # Find and combine validation files
-                              validation_file=$(gsutil ls "gs://uball-training-data/games/$game_id/video_validation_*.jsonl" 2>/dev/null | sort | tail -1 || echo "")
-                              if [ -n "$validation_file" ]; then
-                                echo "📥 Downloading validation file: $validation_file"
-                                gsutil cp "$validation_file" "/tmp/game${game_count}_validation.jsonl" 2>/dev/null || true
-                                if [ -f "/tmp/game${game_count}_validation.jsonl" ]; then
-                                  cat "/tmp/game${game_count}_validation.jsonl" >> /tmp/combined_validation.jsonl
-                                  echo "✅ Added validation data for game $game_id"
-                                fi
-                              fi
-                            done
-
-                            # Check results
-                            training_lines=$(wc -l < /tmp/combined_training.jsonl)
-                            validation_lines=$(wc -l < /tmp/combined_validation.jsonl)
-
-                            echo "📊 Summary:"
-                            echo "  - Processed games: $game_count"
-                            echo "  - Training examples: $training_lines"
-                            echo "  - Validation examples: $validation_lines"
-
-                            if [ "$training_lines" -eq 0 ]; then
-                              echo "❌ No training data found!"
-                              exit 1
-                            fi
-
-                            # Upload combined files
-                            echo "📤 Uploading combined files..."
-                            gsutil cp /tmp/combined_training.jsonl "gs://uball-training-data/${EXECUTION_DIR}/combined_training.jsonl"
-                            gsutil cp /tmp/combined_validation.jsonl "gs://uball-training-data/${EXECUTION_DIR}/combined_validation.jsonl"
-
-                            echo "✅ Combined files ready!"
-                        env:
-                        - name: EXECUTION_DIR
-                          value: ${execution_dir}
-                        - name: GAME_IDS
-                          value: ${game_ids_str}
-                        resources:
-                          limits:
-                            memory: 4Gi
-                            cpu: "2"
-                      maxRetries: 3
-                      timeoutSeconds: "1800"
-        result: combine_job
-
-    - run_combine_job:
-        call: googleapis.run.v1.namespaces.jobs.run
+    - log_combine_complete:
+        call: sys.log
         args:
-          name: '${"namespaces/" + project_id + "/jobs/" + combine_job.metadata.name}'
-          location: ${region}
-        result: combine_execution
-
-    - wait_combine:
-        call: wait_job_complete
-        args:
-          execution_name: ${combine_execution.metadata.name}
-          project_id: ${project_id}
+          data: '${"✅ Combined JSONL files: " + string(combine_result.body.training_examples) + " training examples, " + string(combine_result.body.validation_examples) + " validation examples"}'
+          severity: INFO
 
     # Step 4: Start Vertex AI tuning
     - set_file_paths:
@@ -353,36 +253,54 @@ poll_games_completion:
           - next_iteration:
               next: poll_loop
 
-# Wait for Cloud Run job completion
-wait_job_complete:
-  params: [execution_name, project_id]
+# Wait for Cloud Run job completion (v2 API)
+wait_job_complete_v2:
+  params: [execution_name]
   steps:
-    - poll_loop:
+    - init_polling:
         assign:
           - iterations: 0
           - max_iterations: 120
-    - check_status:
-        call: googleapis.run.v1.namespaces.executions.get
-        args:
-          name: '${"namespaces/" + project_id + "/executions/" + execution_name}'
-          location: us-central1
-        result: status
-    - evaluate_status:
-        switch:
-          - condition: ${len(status.status.conditions) > 0 and status.status.conditions[0].type == "Completed"}
-            return: ${status}
-          - condition: ${len(status.status.conditions) > 0 and status.status.conditions[0].type == "Failed"}
-            raise: '${"Execution failed: " + status.status.conditions[0].message}'
-          - condition: ${iterations >= max_iterations}
-            raise: "Execution timed out"
-    - wait_and_retry:
-        call: sys.sleep
-        args:
-          seconds: 30
-    - increment_and_continue:
-        assign:
-          - iterations: ${iterations + 1}
-        next: check_status
+
+    - poll_loop:
+        steps:
+          - check_status:
+              call: http.get
+              args:
+                url: '${"https://run.googleapis.com/v2/" + execution_name}'
+                auth:
+                  type: OAuth2
+              result: execution_status
+
+          - check_completion:
+              switch:
+                - condition: ${"completionTime" in execution_status.body}
+                  steps:
+                    - log_completed:
+                        call: sys.log
+                        args:
+                          data: "✅ Job execution completed successfully"
+                          severity: INFO
+                    - return_completed:
+                        return: ${execution_status}
+                - condition: ${iterations >= max_iterations}
+                  raise: "Execution timed out after 1 hour"
+
+          - log_still_running:
+              call: sys.log
+              args:
+                data: '${"⏳ Job execution still running (iteration " + string(iterations) + ")"}'
+                severity: INFO
+
+          - wait_and_retry:
+              call: sys.sleep
+              args:
+                seconds: 30
+
+          - increment_iterations:
+              assign:
+                - iterations: ${iterations + 1}
+              next: poll_loop
 
 # Monitor Vertex AI tuning job
 monitor_tuning:
@@ -417,3 +335,4 @@ monitor_tuning:
         assign:
           - iterations: ${iterations + 1}
         next: check_tuning
+

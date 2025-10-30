@@ -1,4 +1,0 @@
-# Train Model Job Dependencies
-google-cloud-aiplatform==1.*
-google-cloud-storage==2.*
-python-dotenv==1.*
